@@ -155,9 +155,23 @@ int entry_point(struct ggml_et_mul_mat_id_params* params, void* env) {
         int64_t m = m0;
         int64_t left = run_len;
 
-        // Paired-row dots: each call processes 2 adjacent rows sharing one B
-        // load. Halves B bandwidth for runs of length >= 2.
+        // Paired-row dots: x4 shares one B load across 4 rows; x2 across 2.
         if (use_x2) {
+            while (left >= 4) {
+                const block_q4_0* row0 = (const block_q4_0*)(expert_base + m       * (int64_t)nb01);
+                const block_q4_0* row1 = (const block_q4_0*)(expert_base + (m + 1) * (int64_t)nb01);
+                const block_q4_0* row2 = (const block_q4_0*)(expert_base + (m + 2) * (int64_t)nb01);
+                const block_q4_0* row3 = (const block_q4_0*)(expert_base + (m + 3) * (int64_t)nb01);
+                float s0, s1, s2, s3;
+                q4_dot_compute_x4_aligned(row0, row1, row2, row3, b_col_base, K_blocks,
+                                          &s0, &s1, &s2, &s3);
+                atomic_store_f32((volatile float*)(dst_slot + m       * (int64_t)nbd0), s0);
+                atomic_store_f32((volatile float*)(dst_slot + (m + 1) * (int64_t)nbd0), s1);
+                atomic_store_f32((volatile float*)(dst_slot + (m + 2) * (int64_t)nbd0), s2);
+                atomic_store_f32((volatile float*)(dst_slot + (m + 3) * (int64_t)nbd0), s3);
+                m    += 4;
+                left -= 4;
+            }
             while (left >= 2) {
                 const block_q4_0* row0 = (const block_q4_0*)(expert_base + m       * (int64_t)nb01);
                 const block_q4_0* row1 = (const block_q4_0*)(expert_base + (m + 1) * (int64_t)nb01);
