@@ -53,12 +53,22 @@ struct ggml_et_rope_params {
 // Existing scalar helpers
 //------------------------------------------------------------------------------
 
+// floor/ceil with ±inf and NaN passthrough (matches IEEE floorf/ceilf semantics).
+// Plain (int) cast is undefined for inf/NaN and would yield garbage.
 static inline float rope_floorf(float x) {
+    union { float f; uint32_t u; } v = { .f = x };
+    const uint32_t expo = (v.u >> 23) & 0xFF;
+    if (expo == 0xFF) return x;          // inf or NaN
+    if (expo >= 23 + 127) return x;       // already integer-valued
     int i = (int)x;
     return (x < 0.0f && (float)i != x) ? (float)(i - 1) : (float)i;
 }
 
 static inline float rope_ceilf(float x) {
+    union { float f; uint32_t u; } v = { .f = x };
+    const uint32_t expo = (v.u >> 23) & 0xFF;
+    if (expo == 0xFF) return x;          // inf or NaN
+    if (expo >= 23 + 127) return x;       // already integer-valued
     int i = (int)x;
     return (x > 0.0f && (float)i != x) ? (float)(i + 1) : (float)i;
 }
