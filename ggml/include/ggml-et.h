@@ -23,6 +23,18 @@ GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_et_host_buffer_type(voi
 
 GGML_BACKEND_API ggml_backend_reg_t ggml_backend_et_reg(void);
 
+// Profiling API
+struct ggml_et_profile_stats {
+    uint64_t cycles;
+    uint64_t instructions;
+    uint64_t l2_misses;
+    uint64_t l2_reads;
+    uint64_t l2_writes;
+};
+
+GGML_BACKEND_API void ggml_et_set_profiling(ggml_backend_t backend, bool enabled);
+GGML_BACKEND_API bool ggml_et_get_profile_stats(ggml_backend_t backend, struct ggml_et_profile_stats * out_stats);
+
 #ifdef  __cplusplus
 }
 #endif

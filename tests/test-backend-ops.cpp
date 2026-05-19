@@ -19,6 +19,9 @@
 #include <ggml-alloc.h>
 #include <ggml-backend.h>
 #include <ggml-cpp.h>
+#ifdef GGML_USE_ET
+#include <ggml-et.h>
+#endif
 
 #include <algorithm>
 #include <array>
@@ -535,6 +538,11 @@ struct test_result {
     std::string device_description;
     std::string backend_reg_name;
 
+    // ET-SOC1 profiling fields
+    uint64_t    et_cycles;
+    uint64_t    et_instructions;
+    uint64_t    et_l2_misses;
+
     test_result() {
         // Initialize with default values
         time_us        = 0.0;
@@ -544,6 +552,9 @@ struct test_result {
         n_runs         = 0;
         supported      = false;
         passed         = false;
+        et_cycles      = 0;
+        et_instructions= 0;
+        et_l2_misses   = 0;
 
         // Set test time
         time_t t = time(NULL);
@@ -558,7 +569,8 @@ struct test_result {
     test_result(const std::string & backend_name, const std::string & op_name, const std::string & op_params,
                 const std::string & test_mode, bool supported, bool passed, const std::string & error_message = "",
                 double time_us = 0.0, double flops = 0.0, double bandwidth_gb_s = 0.0, size_t memory_kb = 0,
-                int n_runs = 0, const std::string & device_description = "", const std::string & backend_reg_name = "") :
+                int n_runs = 0, const std::string & device_description = "", const std::string & backend_reg_name = "",
+                uint64_t et_cycles = 0, uint64_t et_instructions = 0, uint64_t et_l2_misses = 0) :
         backend_name(backend_name),
         op_name(op_name),
         op_params(op_params),
@@ -572,7 +584,10 @@ struct test_result {
         memory_kb(memory_kb),
         n_runs(n_runs),
         device_description(device_description),
-        backend_reg_name(backend_reg_name) {
+        backend_reg_name(backend_reg_name),
+        et_cycles(et_cycles),
+        et_instructions(et_instructions),
+        et_l2_misses(et_l2_misses) {
         // Set test time
         time_t t = time(NULL);
         char   buf[32];
@@ -587,7 +602,7 @@ struct test_result {
         static const std::vector<std::string> fields = {
             "test_time", "build_commit",  "backend_name", "op_name", "op_params",      "test_mode", "supported",
             "passed",    "error_message", "time_us",      "flops",   "bandwidth_gb_s", "memory_kb", "n_runs",
-            "device_description", "backend_reg_name"
+            "device_description",  "backend_reg_name", "et_cycles", "et_instructions", "et_l2_misses"
         };
         return fields;
     }
@@ -598,7 +613,7 @@ struct test_result {
         if (field == "supported" || field == "passed") {
             return BOOL;
         }
-        if (field == "memory_kb" || field == "n_runs") {
+        if (field == "memory_kb" || field == "n_runs"  || field == "et_cycles" || field == "et_instructions" || field == "et_l2_misses") {
             return INT;
         }
         if (field == "time_us" || field == "flops" || field == "bandwidth_gb_s") {
@@ -623,7 +638,10 @@ struct test_result {
                  std::to_string(memory_kb),
                  std::to_string(n_runs),
                  device_description,
-                 backend_reg_name };
+                 backend_reg_name,
+                 std::to_string(et_cycles),
+                 std::to_string(et_instructions),
+                 std::to_string(et_l2_misses) };
     }
 };
 
@@ -990,6 +1008,11 @@ struct console_printer : public printer {
                    format_flops(result.flops).c_str());
         } else {
             printf("%8zu kB/run - \033[1;34m%7.2f GB/s\033[0m", result.memory_kb, result.bandwidth_gb_s);
+        }
+        if (result.et_cycles > 0) {
+            double ipc = (double)result.et_instructions / result.et_cycles;
+            printf(" - \033[1;36mET:\033[0m %8lu cycles, %8lu inst (IPC: %.2f), %6lu L2 misses",
+                   result.et_cycles, result.et_instructions, ipc, result.et_l2_misses);
         }
         printf("\n");
     }
@@ -1548,6 +1571,12 @@ struct test_case {
         }
 
         // run
+        #ifdef GGML_USE_ET
+                bool is_et = ggml_backend_is_et(backend);
+                if (is_et) {
+                    ggml_et_set_profiling(backend, true);
+                }
+        #endif
         int64_t total_time_us = 0;
         int64_t total_mem = 0;
         int total_runs = 0;
@@ -1571,9 +1600,21 @@ struct test_case {
         double calculated_bandwidth =
             (op_flops(out) == 0) ? total_mem / (total_time_us / 1e6) / 1024.0 / 1024.0 / 1024.0 : 0.0;
         size_t calculated_memory_kb = op_size(out) / 1024;
-
+        uint64_t et_cycles = 0, et_instructions = 0, et_l2_misses = 0;
+#ifdef GGML_USE_ET
+        if (is_et) {
+            struct ggml_et_profile_stats et_stats = {};
+            if (ggml_et_get_profile_stats(backend, &et_stats)) {
+                et_cycles       = et_stats.cycles;
+                et_instructions = et_stats.instructions;
+                et_l2_misses    = et_stats.l2_misses;
+            }
+            ggml_et_set_profiling(backend, false);
+        }
+#endif
         test_result result(ggml_backend_name(backend), current_op_name, vars(), "perf", true, true, "", avg_time_us,
-                           calculated_flops, calculated_bandwidth, calculated_memory_kb, total_runs);
+            calculated_flops, calculated_bandwidth, calculated_memory_kb, total_runs, "", "",
+            et_cycles, et_instructions, et_l2_misses);
 
         if (output_printer) {
             output_printer->print_test_result(result);

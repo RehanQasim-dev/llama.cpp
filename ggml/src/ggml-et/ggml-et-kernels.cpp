@@ -5,6 +5,8 @@
 #include <fstream>
 #include <cstdlib>
 #include <cstring>
+#include <map>
+#include <algorithm>
 
 #define ET_TRACE_DECODER_IMPL
 #include <et-trace/decoder.h>
@@ -194,7 +196,7 @@ static bool ggml_et_launch_kernel_internal(ggml_backend_et_device_context* dev_c
         k_opts.setShireMask(shire_mask);  // Default: all shires (0xFFFFFFFF)
         k_opts.setBarrier(true);          // Wait for completion
         k_opts.setFlushL3(false);         // No L3 flush needed
-        if(enable_print) {
+        if(enable_print  || dev_ctx->profiling_enabled) {
             k_opts.setUserTracing(
                 reinterpret_cast<uint64_t>(dev_ctx->trace_buffer),
                 static_cast<uint32_t>(ET_TRACE_BUFFER_SIZE),
@@ -221,19 +223,134 @@ static bool ggml_et_launch_kernel_internal(ggml_backend_et_device_context* dev_c
         runtime->kernelLaunch(dev_ctx->default_stream, kernel_id,
                              reinterpret_cast<std::byte*>(params), params_size, k_opts);
 
-        if(enable_print) {
+        if(enable_print  || dev_ctx->profiling_enabled) {
             std::vector<std::byte> hostTraceBuf(ET_TRACE_BUFFER_SIZE);
             runtime->memcpyDeviceToHost(
                 dev_ctx->default_stream, dev_ctx->trace_buffer, hostTraceBuf.data(), ET_TRACE_BUFFER_SIZE);
             runtime->waitForStream(dev_ctx->default_stream);
             const auto* traceHeader = reinterpret_cast<const trace_buffer_std_header_t*>(hostTraceBuf.data());
             const trace_entry_header_t* entry = nullptr;
+
+            // Profiling stats
+            struct compute_packet_t {
+                uint64_t cycle;
+                uint64_t hpm3, hpm4, hpm5, hpm6, hpm7, hpm8;
+                bool operator<(const compute_packet_t& o) const { return cycle < o.cycle; }
+            };
+            std::map<uint16_t, std::vector<compute_packet_t>> compute_even;
+            std::map<uint16_t, std::vector<compute_packet_t>> compute_odd;
+
+            struct sc_packet_t {
+                uint64_t cycle;
+                uint64_t sc0, sc1;
+                bool operator<(const sc_packet_t& o) const { return cycle < o.cycle; }
+            };
+            std::map<uint16_t, std::vector<sc_packet_t>> sc_packets;
+
+            struct ms_packet_t {
+                uint64_t cycle;
+                uint64_t ms0, ms1;
+                bool operator<(const ms_packet_t& o) const { return cycle < o.cycle; }
+            };
+            std::map<uint8_t, std::vector<ms_packet_t>> ms_packets;
+
             while ((entry = Trace_Decode(traceHeader, entry))) {
-                if (entry->type != TRACE_TYPE_STRING) {
-                    continue;
+                if (entry->type == TRACE_TYPE_STRING && enable_print) {
+                    const auto* strEntry = reinterpret_cast<const trace_string_t*>(entry);
+                    printf("[hart %d] %s", entry->hart_id, strEntry->string);
+                } else if (entry->type == TRACE_TYPE_PMC_COUNTERS_COMPUTE) {
+                    const auto* pmc = reinterpret_cast<const trace_pmc_counters_compute_t*>(entry);
+                    uint16_t neigh_id = entry->hart_id >> 4;
+                    compute_packet_t p = {entry->cycle, pmc->hpmcounter3, pmc->hpmcounter4, pmc->hpmcounter5, pmc->hpmcounter6, pmc->hpmcounter7, pmc->hpmcounter8};
+                    if ((entry->hart_id % 2) == 0) {
+                        compute_even[neigh_id].push_back(p);
+                    } else {
+                        compute_odd[neigh_id].push_back(p);
+                    }
+                } else if (entry->type == TRACE_TYPE_PMC_COUNTERS_SC) {
+                    const auto* sc = reinterpret_cast<const trace_pmc_counters_sc_t*>(entry);
+                    uint16_t neigh_id = entry->hart_id >> 4; // 16 threads per neighborhood
+                    sc_packets[neigh_id].push_back({entry->cycle, sc->sc_pmc0, sc->sc_pmc1});
+                } else if (entry->type == TRACE_TYPE_PMC_COUNTERS_MS) {
+                    const auto* ms = reinterpret_cast<const trace_pmc_counters_ms_t*>(entry);
+                    ms_packets[ms->ms_id].push_back({entry->cycle, ms->ms_pmc0, ms->ms_pmc1});
                 }
-                const auto* strEntry = reinterpret_cast<const trace_string_t*>(entry);
-                printf("[hart %d] %s", entry->hart_id, strEntry->string);
+            }
+
+            if (dev_ctx->profiling_enabled) {
+                auto& accum = dev_ctx->profile_accumulators[kernel_name];
+                accum.runs++;
+
+                std::map<uint16_t, uint64_t> max_cycles_per_shire;
+
+                for (auto& kv : compute_even) {
+                    uint16_t neigh_id = kv.first;
+                    uint16_t shire_id = neigh_id >> 2;
+                    auto& ss = accum.shires[shire_id];
+                    ss.active = true;
+
+                    auto& vec = kv.second;
+                    if (vec.size() >= 2) {
+                        std::sort(vec.begin(), vec.end());
+                        auto& end_p = vec[vec.size() - 1];
+                        auto& start_p = vec[vec.size() - 2];
+
+                        uint64_t cycles = end_p.hpm3 - start_p.hpm3;
+                        if (cycles > max_cycles_per_shire[shire_id]) {
+                            max_cycles_per_shire[shire_id] = cycles;
+                        }
+
+                        ss.instructions += (end_p.hpm4 + end_p.hpm5) - (start_p.hpm4 + start_p.hpm5);
+                        ss.l2_misses += end_p.hpm6 - start_p.hpm6;
+                    }
+                }
+
+                for (auto& kv : compute_odd) {
+                    uint16_t neigh_id = kv.first;
+                    uint16_t shire_id = neigh_id >> 2;
+                    auto& ss = accum.shires[shire_id];
+                    ss.active = true;
+
+                    auto& vec = kv.second;
+                    if (vec.size() >= 2) {
+                        std::sort(vec.begin(), vec.end());
+                        auto& end_p = vec[vec.size() - 1];
+                        auto& start_p = vec[vec.size() - 2];
+                        ss.instructions += (end_p.hpm4 + end_p.hpm5) - (start_p.hpm4 + start_p.hpm5);
+                        ss.l2_misses += end_p.hpm6 - start_p.hpm6;
+                    }
+                }
+
+                for (const auto& kv : max_cycles_per_shire) {
+                    accum.shires[kv.first].cycles += kv.second;
+                }
+
+                for (auto& kv : sc_packets) {
+                    uint16_t shire_id = kv.first >> 2;
+                    auto& ss = accum.shires[shire_id];
+                    ss.active = true;
+                    auto& vec = kv.second;
+                    if (vec.size() >= 2) {
+                        std::sort(vec.begin(), vec.end());
+                        auto& end_p = vec[vec.size() - 1];
+                        auto& start_p = vec[vec.size() - 2];
+                        ss.l2_reads += end_p.sc0 - start_p.sc0;
+                        ss.l2_writes += end_p.sc1 - start_p.sc1;
+                    }
+                }
+
+                for (auto& kv : ms_packets) {
+                    auto& mss = accum.ms[kv.first];
+                    mss.active = true;
+                    auto& vec = kv.second;
+                    if (vec.size() >= 2) {
+                        std::sort(vec.begin(), vec.end());
+                        auto& end_p = vec[vec.size() - 1];
+                        auto& start_p = vec[vec.size() - 2];
+                        mss.ms0 += end_p.ms0 - start_p.ms0;
+                        mss.ms1 += end_p.ms1 - start_p.ms1;
+                    }
+                }
             }
         }
 
@@ -440,4 +557,55 @@ std::vector<std::pair<std::string, rt::KernelId>> ggml_et_get_loaded_kernels(ggm
         loaded_kernels.push_back(kernel_pair);
     }
     return loaded_kernels;
+}
+
+
+void ggml_et_dump_and_reset_profile(ggml_backend_et_device_context* dev_ctx) {
+    if (dev_ctx->profile_accumulators.empty()) return;
+
+    std::string filename = "et_events.csv";
+    {
+        std::ifstream probe(filename);
+        if (probe.good()) {
+            for (int i = 1; ; ++i) {
+                std::string candidate = "et_events_" + std::to_string(i) + ".csv";
+                std::ifstream p2(candidate);
+                if (!p2.good()) { filename = candidate; break; }
+            }
+        }
+    }
+
+    std::ofstream ofs(filename);
+    if (ofs.is_open()) {
+        ofs << "Kernel,Type,ID,Cycles,Instructions,IPC,L2Miss,SC_Reads,SC_Writes,MS_Reads,MS_Writes\n";
+        for (const auto& kv : dev_ctx->profile_accumulators) {
+            const auto& kernel_name = kv.first;
+            const auto& accum = kv.second;
+            if (accum.runs == 0) continue;
+
+            for (const auto& sh : accum.shires) {
+                if (sh.second.active) {
+                    uint64_t cycles = sh.second.cycles / accum.runs;
+                    uint64_t inst   = sh.second.instructions / accum.runs;
+                    double   ipc    = cycles > 0 ? (double)inst / (double)cycles : 0.0;
+                    ofs << kernel_name << ",Shire," << sh.first << ","
+                        << cycles << ","
+                        << inst << ","
+                        << ipc << ","
+                        << (sh.second.l2_misses / accum.runs) << ","
+                        << (sh.second.l2_reads / accum.runs) << ","
+                        << (sh.second.l2_writes / accum.runs) << ",,\n";
+                }
+            }
+            for (const auto& ms : accum.ms) {
+                if (ms.second.active) {
+                    ofs << kernel_name << ",MemShire," << (int)ms.first << ",,,,,,,"
+                        << (ms.second.ms0 / accum.runs) << ","
+                        << (ms.second.ms1 / accum.runs) << "\n";
+                }
+            }
+        }
+    }
+
+    dev_ctx->profile_accumulators.clear();
 }

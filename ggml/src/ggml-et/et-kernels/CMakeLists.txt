@@ -42,6 +42,7 @@ foreach(KERNEL ${KERNELS})
     target_sources(${KERNEL}.elf PRIVATE
         src/${KERNEL}.c
         src/crt.S
+        src/profiling.c
     )
     target_include_directories(${KERNEL}.elf PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src

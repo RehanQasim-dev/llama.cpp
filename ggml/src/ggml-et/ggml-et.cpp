@@ -1,4 +1,4 @@
-#include "ggml-et.h"
+    #include "ggml-et.h"
 #include "ggml-et-common.h"
 #include "ggml-et-kernels.h"
 #include "ggml-et-memops.h"
@@ -2035,3 +2035,77 @@ ggml_backend_buffer_type_t ggml_backend_et_host_buffer_type(void) {
 }
 
 GGML_BACKEND_DL_IMPL(ggml_backend_et_reg)
+
+void ggml_et_set_profiling(ggml_backend_t backend, bool enabled) {
+    if (!ggml_backend_is_et(backend)) return;
+    ggml_backend_et_device_context * dev_ctx = (ggml_backend_et_device_context *)backend->device->context;
+
+    // Gate profiling behind the GGML_ET_PROFILE env var. If unset/0/false,
+    // requests to enable profiling are ignored so kernels don't record stats
+    // and no CSV is produced.
+    static const bool env_enable = []() {
+        const char * v = std::getenv("GGML_ET_PROFILE");
+        if (!v || !*v) return false;
+        if (v[0] == '0') return false;
+        if (!strcasecmp(v, "false") || !strcasecmp(v, "off") || !strcasecmp(v, "no")) return false;
+        return true;
+    }();
+
+    if (enabled && !env_enable) {
+        return;
+    }
+
+    if (dev_ctx->profiling_enabled && !enabled) {
+        ggml_et_dump_and_reset_profile(dev_ctx);
+    }
+    dev_ctx->profiling_enabled = enabled;
+}
+
+bool ggml_et_get_profile_stats(ggml_backend_t backend, struct ggml_et_profile_stats * out_stats) {
+    if (!ggml_backend_is_et(backend)) return false;
+    ggml_backend_et_device_context * dev_ctx = (ggml_backend_et_device_context *)backend->device->context;
+
+    out_stats->cycles = 0;
+    out_stats->instructions = 0;
+    out_stats->l2_misses = 0;
+    out_stats->l2_reads = 0;
+    out_stats->l2_writes = 0;
+
+    for (const auto& kv : dev_ctx->profile_accumulators) {
+        const auto& accum = kv.second;
+        if (accum.runs == 0) continue;
+
+        uint64_t max_cycles = 0;
+        uint64_t sum_inst = 0;
+        uint64_t sum_l2m = 0;
+        uint64_t sum_l2r = 0;
+        uint64_t sum_l2w = 0;
+        uint32_t active_shires = 0;
+
+        for (const auto& sh : accum.shires) {
+            if (sh.second.active) {
+                active_shires++;
+                if (sh.second.cycles > max_cycles) max_cycles = sh.second.cycles;
+                sum_inst += sh.second.instructions;
+                sum_l2m += sh.second.l2_misses;
+                sum_l2r += sh.second.l2_reads;
+                sum_l2w += sh.second.l2_writes;
+            }
+        }
+
+        if (active_shires > 0) {
+            sum_inst /= active_shires;
+            sum_l2m /= active_shires;
+            sum_l2r /= active_shires;
+            sum_l2w /= active_shires;
+        }
+
+        out_stats->cycles += (max_cycles / accum.runs);
+        out_stats->instructions += (sum_inst / accum.runs);
+        out_stats->l2_misses += (sum_l2m / accum.runs);
+        out_stats->l2_reads += (sum_l2r / accum.runs);
+        out_stats->l2_writes += (sum_l2w / accum.runs);
+    }
+
+    return true;
+}

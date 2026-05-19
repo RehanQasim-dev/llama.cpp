@@ -42,6 +42,9 @@ bool ggml_et_uberkernel_failed(const ggml_backend_et_uberkernel_context * uk_ctx
 void ggml_et_unload_kernel(ggml_backend_et_device_context* dev_ctx,
                            const std::string& kernel_name);
 
+// Dump accumulated profile stats to CSV and reset accumulators
+void ggml_et_dump_and_reset_profile(ggml_backend_et_device_context* dev_ctx);
+
 // Unload all kernels from device context
 // Called during device cleanup
 void ggml_et_unload_all_kernels(ggml_backend_et_device_context* dev_ctx);
