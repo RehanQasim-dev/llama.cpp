@@ -41,7 +41,7 @@
 #include "quants.h"
 #include "block_ops.h"
 
-#define MAX_SLOT_BUF  256
+#define MAX_SLOT_BUF  384
 #define MAX_N_EXPERT  128
 
 // Pack (slot, batch) into one 32-bit token.
