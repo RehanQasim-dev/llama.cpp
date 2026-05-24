@@ -7,31 +7,14 @@
 //   ids: I32 [n_expert_used, batch]
 //   C: F32   [M, n_expert_used, batch]
 //
-// Strategy (prefill-friendly 2x2 tile):
-//   - Bucket every (slot, batch) routing by expert id (counting sort, done
-//     locally on each hart). Outputs that share an expert can then be paired
-//     across activation rows, not only across `m`.
-//   - Work unit = (non-empty expert, m-pair). Harts each own a contiguous
-//     chunk so harts with light routes don't sit idle.
-//   - Inside a unit we walk that expert's slot list in pairs and call the
-//     2x2 dot: two weight rows x two B columns -> four outputs, reusing
-//     both A loads across columns and B loads across rows.
-//   - Tail cases: odd slot count -> x2 (2 m, 1 slot); odd m -> single-row
-//     dots over each slot. Decode (1 slot/expert) always falls through to x2
-//     or single.
-//   - Invalid expert ids are zeroed by hart 0 in a direct scan of src2.
-//
-// Stack budget (per hart):
-//   slot_tokens[MAX_SLOT_BUF]  = 256 * 4 =  1 KB
-//   expert_off[MAX_N_EXPERT+1] = 129 * 4 =  ~0.5 KB
-//   nonempty[MAX_N_EXPERT]     = 128 * 4 =  ~0.5 KB
-//   cursor[MAX_N_EXPERT]       = 128 * 4 =  ~0.5 KB
-//   Total                                ~= 2.5 KB  (fits easily)
-//
-// Fallback to the simple m-major loop when:
-//   - nb01 is not 32-byte aligned (x2/2x2 asm requires it)
-//   - total_routings > MAX_SLOT_BUF (too many to sort on-stack)
-//   - n_expert > MAX_N_EXPERT
+// Strategy (V1, streaming pair-merge — batch-size independent stack):
+//   - One pass over src2 builds expert counts (MAX_N_EXPERT ints).
+//   - Work unit = (non-empty expert, m-pair). Same distribution as before,
+//     but the slot list is NOT materialized. Each unit walks src2 linearly
+//     and pair-merges on the fly: keep one "pending" (s, b); on second hit
+//     emit a 2x2 (or x2 when m1 is out of bounds) dot; flush at end with
+//     x2 / single.
+//   - Total per-hart stack ~= 1 KB regardless of batch.
 //******************************************************************************
 
 #include <stdint.h>
@@ -41,19 +24,10 @@
 #include "quants.h"
 #include "block_ops.h"
 
-#define MAX_SLOT_BUF  384
-#define MAX_N_EXPERT  128
+#define MAX_N_EXPERT 128
 
-// Pack (slot, batch) into one 32-bit token.
-// Both slot < n_expert_used and batch are small in practice (<= 64K).
-static inline uint32_t pack_sb(uint32_t slot, uint32_t b) {
-    return (b << 16) | (slot & 0xFFFFu);
-}
-static inline uint32_t unpack_slot(uint32_t tok)  { return tok & 0xFFFFu; }
-static inline uint32_t unpack_batch(uint32_t tok) { return tok >> 16; }
-
-// Fallback: original m-major iteration. Used when grouping caps are exceeded
-// or when alignment is not suitable for x2/2x2.
+// Fallback: original m-major iteration. Used when alignment is unsuitable
+// or n_expert exceeds the stack-budget cap.
 static void run_simple(int thread_id, int num_threads,
                        const struct ggml_tensor* src0,
                        const struct ggml_tensor* src1,
@@ -182,16 +156,14 @@ int entry_point(struct ggml_et_mul_mat_id_params* params, void* env) {
         src2->nb[0] != sizeof(int32_t)    || nbd0 != sizeof(float))
         return -1;
 
-    const int64_t K_blocks        = K / QK4_0;
-    const int     use_x2          = ((nb01 & 31) == 0);
-    const int64_t total_routings  = n_expert_used * batch;
+    const int64_t K_blocks       = K / QK4_0;
+    const int     use_x2         = ((nb01 & 31) == 0);
+    const int64_t total_routings = n_expert_used * batch;
 
     if (total_routings == 0 || M == 0) return 0;
 
-    // Fall back to m-major when caps exceeded or alignment unsuitable.
-    if (!use_x2 ||
-        total_routings > MAX_SLOT_BUF ||
-        n_expert > MAX_N_EXPERT) {
+    // Fall back when alignment is unsuitable or expert count exceeds cap.
+    if (!use_x2 || n_expert > MAX_N_EXPERT) {
         q4_dot_state q4_state;
         q4_dot_begin(&q4_state);
         run_simple(thread_id, num_threads, src0, src1, src2, dst);
@@ -199,48 +171,28 @@ int entry_point(struct ggml_et_mul_mat_id_params* params, void* env) {
         return 0;
     }
 
-    // ---- Per-hart counting sort: bucket routings by expert id ----
-    // Stack budget: ~2.5 KB total (all arrays sized to caps above).
-    int32_t  expert_off[MAX_N_EXPERT + 1];
-    uint32_t slot_tokens[MAX_SLOT_BUF];
-    int32_t  cursor[MAX_N_EXPERT];
-    int32_t  nonempty[MAX_N_EXPERT];
+    // ---- One scan of src2 → per-expert counts (~512 B stack) ----
+    int32_t expert_cnt[MAX_N_EXPERT];
+    int32_t nonempty[MAX_N_EXPERT];
+    for (int64_t e = 0; e < n_expert; e++) expert_cnt[e] = 0;
 
-    for (int64_t e = 0; e <= n_expert; e++) expert_off[e] = 0;
-
-    // Count valid routings per expert. Invalid expert ids are handled
-    // separately by hart 0 below.
+    int32_t any_invalid = 0;
     for (int64_t b = 0; b < batch; b++) {
         for (int64_t s = 0; s < n_expert_used; s++) {
             const int32_t e = *(const int32_t*)((const char*)src2_data
                               + s * (int64_t)nb20 + b * (int64_t)nb21);
-            if (e >= 0 && e < n_expert) expert_off[e + 1]++;
-        }
-    }
-    // Prefix sum.
-    for (int64_t e = 1; e <= n_expert; e++) expert_off[e] += expert_off[e - 1];
-
-    // Place tokens. cursor starts at each expert's base offset.
-    for (int64_t e = 0; e < n_expert; e++) cursor[e] = expert_off[e];
-    for (int64_t b = 0; b < batch; b++) {
-        for (int64_t s = 0; s < n_expert_used; s++) {
-            const int32_t e = *(const int32_t*)((const char*)src2_data
-                              + s * (int64_t)nb20 + b * (int64_t)nb21);
-            if (e >= 0 && e < n_expert)
-                slot_tokens[cursor[e]++] = pack_sb((uint32_t)s, (uint32_t)b);
+            if (e >= 0 && e < n_expert) expert_cnt[e]++;
+            else                        any_invalid = 1;
         }
     }
 
-    // Build compact list of non-empty experts.
     int32_t n_nonempty = 0;
     for (int64_t e = 0; e < n_expert; e++) {
-        if (expert_off[e + 1] > expert_off[e])
-            nonempty[n_nonempty++] = (int32_t)e;
+        if (expert_cnt[e] > 0) nonempty[n_nonempty++] = (int32_t)e;
     }
 
-    // Hart 0 handles invalid-expert outputs (rare in practice, O(M) per bad
-    // routing). No extra storage needed — just scan src2 directly.
-    if (thread_id == 0) {
+    // Hart 0 zeros outputs of invalid routings (cheap, almost never hit).
+    if (any_invalid && thread_id == 0) {
         for (int64_t b = 0; b < batch; b++) {
             for (int64_t s = 0; s < n_expert_used; s++) {
                 const int32_t e = *(const int32_t*)((const char*)src2_data
@@ -272,16 +224,13 @@ int entry_point(struct ggml_et_mul_mat_id_params* params, void* env) {
     q4_dot_begin(&q4_state);
 
     for (uint64_t u = my_start; u < my_end; u++) {
-        const int32_t nei   = (int32_t)(u / (uint64_t)m_pairs_per_expert);
-        const int64_t mp    = (int64_t)(u - (uint64_t)nei * (uint64_t)m_pairs_per_expert);
-        const int32_t e     = nonempty[nei];
+        const int32_t nei    = (int32_t)(u / (uint64_t)m_pairs_per_expert);
+        const int64_t mp     = (int64_t)(u - (uint64_t)nei * (uint64_t)m_pairs_per_expert);
+        const int32_t e      = nonempty[nei];
 
-        const int64_t m0    = 2 * mp;
-        const int64_t m1    = m0 + 1;
+        const int64_t m0     = 2 * mp;
+        const int64_t m1     = m0 + 1;
         const int     has_m1 = (m1 < M);
-
-        const int32_t slot_lo = expert_off[e];
-        const int32_t slot_hi = expert_off[e + 1];
 
         const char*       ebase = (const char*)src0_data + (int64_t)e * (int64_t)nb02;
         const block_q4_0* row0  = (const block_q4_0*)(ebase + m0 * (int64_t)nb01);
@@ -289,59 +238,66 @@ int entry_point(struct ggml_et_mul_mat_id_params* params, void* env) {
             ? (const block_q4_0*)(ebase + m1 * (int64_t)nb01)
             : NULL;
 
-        int32_t i = slot_lo;
+        // Streaming pair-merge over src2: on each hit for this expert,
+        // either stash as pending or pair with the pending one and emit.
+        int32_t  have_pending = 0;
+        uint32_t s_p = 0, b_p = 0;
 
-        if (has_m1) {
-            // Main path: 2x2 tile — 2 weight rows x 2 B columns -> 4 outputs.
-            while (i + 1 < slot_hi) {
-                const uint32_t tok0 = slot_tokens[i];
-                const uint32_t tok1 = slot_tokens[i + 1];
-                const uint32_t s0 = unpack_slot(tok0), b0 = unpack_batch(tok0);
-                const uint32_t s1 = unpack_slot(tok1), b1 = unpack_batch(tok1);
+        for (int64_t b = 0; b < batch; b++) {
+            for (int64_t s = 0; s < n_expert_used; s++) {
+                const int32_t eid = *(const int32_t*)((const char*)src2_data
+                                    + s * (int64_t)nb20 + b * (int64_t)nb21);
+                if (eid != e) continue;
 
+                if (!have_pending) {
+                    s_p = (uint32_t)s;
+                    b_p = (uint32_t)b;
+                    have_pending = 1;
+                    continue;
+                }
+
+                // Pair (s_p, b_p) with current (s, b).
                 const float* b_col0 = (const float*)((const char*)src1_data
-                    + ((int64_t)s0 % ne11) * (int64_t)nb11
-                    + (int64_t)b0 * (int64_t)nb12);
+                    + ((int64_t)s_p % ne11) * (int64_t)nb11
+                    + (int64_t)b_p * (int64_t)nb12);
                 const float* b_col1 = (const float*)((const char*)src1_data
-                    + ((int64_t)s1 % ne11) * (int64_t)nb11
-                    + (int64_t)b1 * (int64_t)nb12);
+                    + (s % ne11) * (int64_t)nb11
+                    + b * (int64_t)nb12);
 
-                float r00, r01, r10, r11;
-                q4_dot_compute_2x2_aligned(row0, row1, b_col0, b_col1,
-                                           K_blocks, &r00, &r01, &r10, &r11);
+                char* d0 = (char*)dst_data + (int64_t)s_p * (int64_t)nbd1 + (int64_t)b_p * (int64_t)nbd2;
+                char* d1 = (char*)dst_data + s * (int64_t)nbd1 + b * (int64_t)nbd2;
 
-                char* d0 = (char*)dst_data + (int64_t)s0 * (int64_t)nbd1 + (int64_t)b0 * (int64_t)nbd2;
-                char* d1 = (char*)dst_data + (int64_t)s1 * (int64_t)nbd1 + (int64_t)b1 * (int64_t)nbd2;
-                atomic_store_f32((volatile float*)(d0 + m0 * (int64_t)nbd0), r00);
-                atomic_store_f32((volatile float*)(d1 + m0 * (int64_t)nbd0), r01);
-                atomic_store_f32((volatile float*)(d0 + m1 * (int64_t)nbd0), r10);
-                atomic_store_f32((volatile float*)(d1 + m1 * (int64_t)nbd0), r11);
-                i += 2;
+                if (has_m1) {
+                    float r00, r01, r10, r11;
+                    q4_dot_compute_2x2_aligned(row0, row1, b_col0, b_col1,
+                                               K_blocks, &r00, &r01, &r10, &r11);
+                    atomic_store_f32((volatile float*)(d0 + m0 * (int64_t)nbd0), r00);
+                    atomic_store_f32((volatile float*)(d1 + m0 * (int64_t)nbd0), r01);
+                    atomic_store_f32((volatile float*)(d0 + m1 * (int64_t)nbd0), r10);
+                    atomic_store_f32((volatile float*)(d1 + m1 * (int64_t)nbd0), r11);
+                } else {
+                    // m1 out of bounds — only m0 row exists; do two single dots.
+                    float sa = q4_dot_compute(row0, b_col0, K_blocks);
+                    float sb = q4_dot_compute(row0, b_col1, K_blocks);
+                    atomic_store_f32((volatile float*)(d0 + m0 * (int64_t)nbd0), sa);
+                    atomic_store_f32((volatile float*)(d1 + m0 * (int64_t)nbd0), sb);
+                }
+                have_pending = 0;
             }
-            // Odd-slot tail: x2 (2 weight rows x 1 B col).
-            if (i < slot_hi) {
-                const uint32_t tok = slot_tokens[i];
-                const uint32_t s = unpack_slot(tok), b = unpack_batch(tok);
-                const float* b_col = (const float*)((const char*)src1_data
-                    + ((int64_t)s % ne11) * (int64_t)nb11
-                    + (int64_t)b * (int64_t)nb12);
+        }
+
+        if (have_pending) {
+            const float* b_col = (const float*)((const char*)src1_data
+                + ((int64_t)s_p % ne11) * (int64_t)nb11
+                + (int64_t)b_p * (int64_t)nb12);
+            char* ds = (char*)dst_data + (int64_t)s_p * (int64_t)nbd1 + (int64_t)b_p * (int64_t)nbd2;
+            if (has_m1) {
                 float s0v, s1v;
                 q4_dot_compute_x2_aligned(row0, row1, b_col, K_blocks, &s0v, &s1v);
-                char* ds = (char*)dst_data + (int64_t)s * (int64_t)nbd1 + (int64_t)b * (int64_t)nbd2;
                 atomic_store_f32((volatile float*)(ds + m0 * (int64_t)nbd0), s0v);
                 atomic_store_f32((volatile float*)(ds + m1 * (int64_t)nbd0), s1v);
-            }
-        } else {
-            // Odd-m tail (m1 >= M): single-row dot over each slot.
-            // Also the decode path naturally lands here when M is odd.
-            for (; i < slot_hi; i++) {
-                const uint32_t tok = slot_tokens[i];
-                const uint32_t s = unpack_slot(tok), b = unpack_batch(tok);
-                const float* b_col = (const float*)((const char*)src1_data
-                    + ((int64_t)s % ne11) * (int64_t)nb11
-                    + (int64_t)b * (int64_t)nb12);
+            } else {
                 float sum = q4_dot_compute(row0, b_col, K_blocks);
-                char* ds = (char*)dst_data + (int64_t)s * (int64_t)nbd1 + (int64_t)b * (int64_t)nbd2;
                 atomic_store_f32((volatile float*)(ds + m0 * (int64_t)nbd0), sum);
             }
         }
