@@ -210,6 +210,18 @@ int entry_point(struct ggml_et_binary_params *params, void *env) {
                 read_act_block_q8_0(a_panel[buf], sa_panel[buf], src1_batch, nb, kb, n_cur, nb1_1);
                 unpack_weight_block(b_panel[buf], dw_panel[buf], src0_batch, mb, kb, nb1_0);
 
+                // Zero-pad the unused activation rows up to TILE_N. Hart 0 always
+                // runs the FMA with arows=TILE_N (the int8 engine corrupts the
+                // high output columns at arows<TILE_N), and the column datapath
+                // reads ALL TILE_N input rows from the scratchpad — so masking
+                // the unused rows' output is NOT enough; their *input* qs must be
+                // clean zeros or one high column leaks garbage. scale_a=0 too.
+                for (int n = (int) n_cur; n < TILE_N; ++n) {
+                    sa_panel[buf][n] = 0.0f;
+                    int8_t *qz = a_panel[buf] + (int64_t) n * 64;
+                    for (int k = 0; k < QK8_0; ++k) qz[k] = 0;
+                }
+
                 FENCE;
                 flush_to_l2(a_panel[buf], PANEL_BYTES / 64, 64);
                 WAIT_CACHEOPS;
@@ -258,6 +270,12 @@ int entry_point(struct ggml_et_binary_params *params, void *env) {
         const int64_t nb = nb_idx * TILE_N;
         const int64_t n_cur = (nb + TILE_N <= N) ? TILE_N : (N - nb);
 
+        // Partial-N tiles (decode/GEMV n_cur=1, or any N not a multiple of
+        // TILE_N) are handled by zero-padding (see hart 1): the FMA always runs
+        // with arows=TILE_N; only n_cur rows are quantized and stored. (Masking
+        // the unused rows instead leaves their stale scratchpad inputs to leak
+        // into the high output column-group, so padding the inputs is required.)
+
         // Zero the FP32 accumulator registers f16..f(16+2*n_cur-1).
         for (int r = 0; r < n_cur * 2; ++r) {
             int reg = ACC_REG_START + r;
@@ -283,7 +301,7 @@ int entry_point(struct ggml_et_binary_params *params, void *env) {
             // load is paired with — and completed by — the TensorFMA below, and
             // requires brows(B) == acols (both 8 here).
             tensor_load(false, false, A_L1_START, TENSOR_LOAD_PLAIN, 0,
-                        (uint64_t) a_panel[buf], 0, n_cur - 1, 64, 0);
+                        (uint64_t) a_panel[buf], 0, TILE_N - 1, 64, 0);
             tensor_wait(TENSOR_LOAD_WAIT_0);
             tensor_load(false, false, S_L1_START, TENSOR_LOAD_PLAIN, 0,
                         (uint64_t) dw_panel[buf], 0, 0, 64, 0);
@@ -295,10 +313,11 @@ int entry_point(struct ggml_et_binary_params *params, void *env) {
             // B (32 x 16 int8, interleaved) -> TenB; pairs with the FMA.
             tensor_load_setup_b(false, (uint64_t) b_panel[buf], 7, 64, 1);
 
-            // TensorIMA8A32: int8 A (n_cur x 32) @ int8 B (32 x 16) -> int32.
+            // TensorIMA8A32: int8 A (TILE_N x 32) @ int8 B (32 x 16) -> int32.
+            // a_num_rows = TILE_N-1 (always 8 rows, see padding note above),
             // a_num_cols = (32/4)-1 = 7, b_num_col = (16/4)-1 = 3.
             // tenb_loc=1 (B from TenB), first_pass=1, tenc2rf=1 (-> FREGS f0..).
-            tensor_fma(false, 3, n_cur - 1, 7, 0,
+            tensor_fma(false, 3, TILE_N - 1, 7, 0,
                        true,            // tenc_loc -> bit23 tenc2rf: copy to FREGS
                        false, false,
                        true,            // tenb_loc=1: B operand from TenB

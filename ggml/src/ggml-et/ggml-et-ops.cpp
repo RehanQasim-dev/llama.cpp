@@ -734,15 +734,15 @@ bool ggml_et_op_mul_mat(ggml_backend_et_device_context* dev_ctx, const ggml_tens
         node->src[0]->type == GGML_TYPE_Q4_0 &&
         node->src[1]->type == GGML_TYPE_F32 &&
         node->src[0]->ne[1] % 16 == 0 &&   // M % TILE_M
-        node->src[0]->ne[0] % 32 == 0 &&   // K % BLOCK_K (Q4_0 block)
-        node->src[1]->ne[1] % 16 == 0) {   // N % TILE_N (full tiles only)
+        node->src[0]->ne[0] % 32 == 0) {   // K % BLOCK_K (Q4_0 block)
 
         // Tensor (matrix) engine, INT8 path: quantize activations to Q8_0 and
         // run TensorIMA8A32 (int8 x int8 -> int32), then scale by the per-block
         // weight (d_w) and activation (scale_a) deltas. This matches ggml's CPU
         // reference for Q4_0 mul_mat (which also dot-products q8_0 activations).
-        // Used for the large-N (prefill) regime with full N tiles. Partial-N
-        // tiles (decode/GEMV) are routed to the vector kernel below.
+        // Handles every N (including decode/GEMV N=1 and partial tiles): the
+        // kernel tiles N by TILE_N=8 and uses tensor_mask to gate the active
+        // rows of the final partial tile.
         kernel_name = "mul_mat_Q4_0_int8_matrix_engine";
         src0_type_name = "Q4_0";
 
