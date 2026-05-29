@@ -737,12 +737,13 @@ bool ggml_et_op_mul_mat(ggml_backend_et_device_context* dev_ctx, const ggml_tens
         node->src[0]->ne[0] % 32 == 0 &&   // K % BLOCK_K (Q4_0 block)
         node->src[1]->ne[1] % 16 == 0) {   // N % TILE_N (full tiles only)
 
-        // Tensor (matrix) engine: dequantize Q4_0 weights to FP32 and run
-        // TensorFMA32. Used for the large-N (prefill) regime with full N tiles.
-        // Partial-N tiles (n_cur < 16, i.e. decode/GEMV) have a known bug and
-        // are routed to the faster, correct vector kernel below; that bug is
-        // fixed in a later step alongside the K-split path.
-        kernel_name = "mul_mat_Q4_0_matrix_engine";
+        // Tensor (matrix) engine, INT8 path: quantize activations to Q8_0 and
+        // run TensorIMA8A32 (int8 x int8 -> int32), then scale by the per-block
+        // weight (d_w) and activation (scale_a) deltas. This matches ggml's CPU
+        // reference for Q4_0 mul_mat (which also dot-products q8_0 activations).
+        // Used for the large-N (prefill) regime with full N tiles. Partial-N
+        // tiles (decode/GEMV) are routed to the vector kernel below.
+        kernel_name = "mul_mat_Q4_0_int8_matrix_engine";
         src0_type_name = "Q4_0";
 
     } else if (node->type == GGML_TYPE_F32 &&
@@ -817,7 +818,45 @@ bool ggml_et_op_mul_mat(ggml_backend_et_device_context* dev_ctx, const ggml_tens
     }
 
     bool kernel_result;
-    if (node->src[0]->type == GGML_TYPE_Q8_0) {
+    if (kernel_name == std::string("mul_mat_Q4_0_int8_matrix_engine")) {
+        // Two-kernel int8 path: quantize src1 (F32) -> Q8_0 scratch, then run the
+        // int8 TensorIMA8A32 mul_mat on (Q4_0 weights, Q8_0 activations).
+        auto runtime = ggml_et_runtime();
+        const int64_t K     = node->src[1]->ne[0];
+        const size_t  rbytes = ggml_row_size(GGML_TYPE_Q8_0, K);
+        const int64_t nrows = node->src[1]->ne[1] * node->src[1]->ne[2] * node->src[1]->ne[3];
+        const size_t  scratch_bytes = rbytes * (size_t) nrows;
+
+        std::byte * q8_scratch = runtime->mallocDevice(dev_ctx->rtid, scratch_bytes);
+        if (!q8_scratch) {
+            GGML_LOG_ERROR("ET: failed to allocate Q8_0 scratch (%zu bytes) for MUL_MAT\n", scratch_bytes);
+            return false;
+        }
+
+        ggml_tensor q8 = *node->src[1];          // same logical shape as activations
+        q8.type  = GGML_TYPE_Q8_0;
+        q8.nb[0] = ggml_type_size(GGML_TYPE_Q8_0);
+        q8.nb[1] = rbytes;
+        q8.nb[2] = q8.nb[1] * q8.ne[1];
+        q8.nb[3] = q8.nb[2] * q8.ne[2];
+        q8.data  = q8_scratch;
+
+        ggml_et_cont_params qparams;
+        qparams.src0 = *node->src[1];            // F32 activations
+        qparams.dst  = q8;                       // Q8_0 scratch
+        bool q_ok = ggml_et_launch_kernel(dev_ctx, "quantize_mat_q8_0", &qparams, sizeof(qparams), 0xFFFFFFFF);
+
+        ggml_et_binary_params iparams;
+        iparams.src0 = *node->src[0];            // Q4_0 weights
+        iparams.src1 = q8;                       // Q8_0 activations
+        iparams.dst  = *fused_dst;
+        bool m_ok = ggml_et_launch_kernel(dev_ctx, kernel_name, &iparams, sizeof(iparams), 0xFFFFFFFF);
+
+        // Both kernels run in order on default_stream; wait before freeing scratch.
+        runtime->waitForStream(dev_ctx->default_stream);
+        runtime->freeDevice(dev_ctx->rtid, q8_scratch);
+        kernel_result = q_ok && m_ok;
+    } else if (node->src[0]->type == GGML_TYPE_Q8_0) {
         // Q8_0 kernel always takes the extended struct. bias.data is non-NULL
         // only on the fused path; otherwise the kernel skips the add entirely.
         ggml_et_mm_q8_params q8_params = {};

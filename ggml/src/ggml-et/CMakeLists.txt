@@ -40,6 +40,8 @@ set(KERNELS
     mul_mat_Q8_0
     mul_mat_Q4_0
     mul_mat_Q4_0_matrix_engine
+    mul_mat_Q4_0_int8_matrix_engine
+    quantize_mat_q8_0
     mul_mat_f16
     mul_mat_f16_matrix_engine
     rope_f32
