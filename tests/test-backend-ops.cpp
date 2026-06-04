@@ -8102,6 +8102,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
 
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 6, 4096, 5120, {1, 1}, {1, 1}));
+    for (int n : {1, 2, 3, 4, 5, 8, 12, 15, 31, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 64, 256, 500, 512, 520, 1024, 2040, 2048}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 8192, n, 2048, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 2048, n, 8192, {1, 1}, {1, 1}));
+    }
+    // Exact Llama-3.2-1B Q8_0 weight shapes (m=out features, k=in features).
+    for (int n : {1, 2, 8, 15, 16, 32, 64, 128}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 2048,   n, 2048, {1, 1}, {1, 1})); // q/o proj
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 512,    n, 2048, {1, 1}, {1, 1})); // k/v proj
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 8192,   n, 2048, {1, 1}, {1, 1})); // ffn gate/up
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 2048,   n, 8192, {1, 1}, {1, 1})); // ffn down
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 128256, n, 2048, {1, 1}, {1, 1})); // lm_head
+    }
 
 #if 0
     // test the mat-mat path for Metal
@@ -8855,6 +8867,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     }
 
     // qwen3-30b-a3b
+    for (int n : {1, 2, 3, 4, 5, 8, 12, 15, 31, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 64, 256, 500, 512, 520, 1024, 2040, 2048}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 8192, n, 2048, {1, 1}, {1, 1}));
+    }
+
     for (int bs : {1, 4, 8, 32, 64, 128, 256, 512}) {
         for (ggml_type type_a : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ2_XS}) {
             for (ggml_type type_b : {GGML_TYPE_F32}) {
