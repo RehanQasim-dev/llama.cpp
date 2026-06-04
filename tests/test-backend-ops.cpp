@@ -24,6 +24,7 @@
 #include <array>
 #include <cfloat>
 #include <cinttypes>
+#include <cmath>
 #include <cstdarg>
 #include <cstdint>
 #include <cstdio>
@@ -3878,20 +3879,75 @@ struct test_mul_mat : public test_case {
     }
 };
 
-static void init_mul_mat_id_tensors(ggml_context * ctx, int n_mats) {
+// imbalance: routing-distribution control for the mul_mat_id ids tensor.
+//   0  -> uniform: each token routes to n_used distinct experts chosen at random,
+//         so every expert receives ~the same number of tokens.
+//   >0 -> Zipf-skewed, deterministic seed (byte-identical routing on both branches).
+//         Zipf exponent s = 0.5 * (imbalance - 1), so:
+//           imbalance=1 -> s=0.0  uniform (every expert ~even, deterministic anchor)
+//           imbalance=2 -> s=0.5  mild skew
+//           imbalance=3 -> s=1.0  moderate skew
+//           imbalance=4 -> s=1.5  strong skew
+//           imbalance=5 -> s=2.0  extreme skew (few hot experts, all still used)
+static void init_mul_mat_id_tensors(ggml_context * ctx, int n_mats, int n_used = -1, int imbalance = 0) {
     std::random_device rd;
-    std::default_random_engine rng(rd());
+    std::default_random_engine rng(imbalance == 0
+        ? rd()
+        : (std::default_random_engine::result_type) (1234u + (unsigned) imbalance));
+
+    std::vector<double> weights(n_mats, 1.0);
+    if (imbalance > 0) {
+        const double s = 0.5 * (imbalance - 1);
+        for (int e = 0; e < n_mats; e++) {
+            weights[e] = 1.0 / std::pow((double) (e + 1), s);
+        }
+    }
+
     for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
         if (t->type == GGML_TYPE_I32) {
             if (ggml_is_view_op(t->op)) { continue; }
+            const int row_len = (int) t->ne[0];                              // == n_mats
+            const int sel     = (n_used > 0 && n_used <= row_len) ? n_used : row_len;
+            std::vector<int64_t> hist(n_mats, 0);
             // ids
             for (int64_t r = 0; r < ggml_nrows(t); r++) {
-                std::vector<int32_t> data(t->ne[0]);
-                for (int i = 0; i < t->ne[0]; i++) {
-                    data[i] = i % n_mats;
+                std::vector<int32_t> data(row_len);
+                if (imbalance == 0) {
+                    for (int i = 0; i < row_len; i++) {
+                        data[i] = i % n_mats;
+                    }
+                    std::shuffle(data.begin(), data.end(), rng);
+                } else {
+                    // weighted sampling without replacement (Efraimidis-Spirakis):
+                    // each expert gets key = log(u)/w; the `sel` largest keys win.
+                    // marginal selection frequency tracks the Zipf weights, and the
+                    // per-token experts stay distinct (required by mul_mat_id).
+                    std::uniform_real_distribution<double> uni(0.0, 1.0);
+                    std::vector<std::pair<double, int>> keys(n_mats);
+                    for (int e = 0; e < n_mats; e++) {
+                        const double u = uni(rng);
+                        keys[e] = { std::log(u) / weights[e], e };
+                    }
+                    std::partial_sort(keys.begin(), keys.begin() + sel, keys.end(),
+                        [](const std::pair<double, int> & a, const std::pair<double, int> & b) {
+                            return a.first > b.first;
+                        });
+                    for (int e = 0; e < n_mats; e++) {
+                        data[e] = keys[e].second;
+                    }
                 }
-                std::shuffle(data.begin(), data.end(), rng);
+                for (int i = 0; i < sel; i++) {
+                    hist[data[i]]++;
+                }
                 ggml_backend_tensor_set(t, data.data(), r * t->nb[1], t->ne[0] * sizeof(int32_t));
+            }
+            if (imbalance > 0) {
+                fprintf(stderr, "[mul_mat_id ids] imbalance=%d n=%ld n_used=%d per-expert token counts:",
+                    imbalance, (long) ggml_nrows(t), sel);
+                for (int e = 0; e < n_mats; e++) {
+                    fprintf(stderr, " %ld", (long) hist[e]);
+                }
+                fprintf(stderr, "\n");
             }
         } else {
             init_tensor_uniform(t);
@@ -3909,9 +3965,10 @@ struct test_mul_mat_id : public test_case {
     const int64_t m;
     const int64_t n;
     const int64_t k;
+    const int imbalance; // 0 = uniform routing; >0 = Zipf-skewed (see init_mul_mat_id_tensors)
 
     std::string vars() override {
-        return VARS_TO_STR8(type_a, type_b, n_mats, n_used, b, m, n, k);
+        return VARS_TO_STR9(type_a, type_b, n_mats, n_used, b, m, n, k, imbalance);
     }
 
     double max_nmse_err() override {
@@ -3933,9 +3990,9 @@ struct test_mul_mat_id : public test_case {
 
     test_mul_mat_id(ggml_type type_a = GGML_TYPE_F32, ggml_type type_b = GGML_TYPE_F32,
             int n_mats = 8, int n_used = 2, bool b = false,
-            int64_t m = 32, int64_t n = 32, int64_t k = 32)
+            int64_t m = 32, int64_t n = 32, int64_t k = 32, int imbalance = 0)
         : type_a(type_a), type_b(type_b), n_mats(n_mats), n_used(n_used), b(b),
-            m(m), n(n), k(k) {
+            m(m), n(n), k(k), imbalance(imbalance) {
             GGML_ASSERT(n_used <= n_mats);
         }
 
@@ -3961,7 +4018,7 @@ struct test_mul_mat_id : public test_case {
     }
 
     void initialize_tensors(ggml_context * ctx) override {
-        init_mul_mat_id_tensors(ctx, n_mats);
+        init_mul_mat_id_tensors(ctx, n_mats, n_used, imbalance);
     }
 };
 
@@ -8150,6 +8207,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_F16, GGML_TYPE_F32, 1, 1, false, 8, 16, 1));
     test_cases.emplace_back(new test_mul_mat_id_fusion(GGML_TYPE_F16, GGML_TYPE_F32, 16, 16, false, 32, 32, 32, 3));
 
+    // imbalanced-routing correctness: exercises the work-balanced partition
+    // (hot expert fanned across many harts, cold experts sharing). filter -p "imbalance=[1-5]"
+    for (int imb : {1, 2, 3, 4, 5}) {
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_0, GGML_TYPE_F32, 32, 4, false, 1792, 2000, 2048, imb));
+    }
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_0, GGML_TYPE_F32, 32, 4, false, 1792, 5000, 2048, 5));
+
     // gpt-oss issue with Vulkan mmq_id
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_MXFP4, GGML_TYPE_F32, 32, 2, false, 2880, 32, 2880));
 
@@ -8860,7 +8924,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     }
 
     // qwen3-30b-a3b
-    for (int bs : {1, 4, 8, 32, 64, 128, 256, 512}) {
+    for (int bs : {1, 4, 8, 32, 64, 128, 256, 512, 766, 1000, 1500, 2000, 3000, 4000, 5000, 6000, 7000, 8000, 9000, 10000}) {
         for (ggml_type type_a : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ2_XS}) {
             for (ggml_type type_b : {GGML_TYPE_F32}) {
                 test_cases.emplace_back(new test_mul_mat_id(type_a, type_b, 128, 8, false, 768, bs, 2048));
@@ -8869,13 +8933,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
     }
 
-    for (int bs : {1, 4, 8, 32, 64, 128, 256, 512}) {
+    for (int bs : {1, 4, 8, 32, 64, 128, 256, 512, 766, 1000, 1500, 2000, 3000, 4000, 5000, 6000, 7000, 8000, 9000, 10000}) {
         for (ggml_type type_a : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ2_XS}) {
             for (ggml_type type_b : {GGML_TYPE_F32}) {
                 test_cases.emplace_back(new test_mul_mat_id(type_a, type_b, 32, 4, false, 1792, bs, 2048));
                 test_cases.emplace_back(new test_mul_mat_id_fusion(type_a, type_b, 32, 4, false, 1792, bs, 2048, 1));
             }
         }
+    }
+
+    // imbalanced-routing experiment: mul_mat_id Q4_0, n_mats=32 n_used=4 m=1792 k=2048, n=5000.
+    // imbalance 1 = deterministic uniform anchor; 2..5 = increasing Zipf skew.
+    // run/filter with: -o MUL_MAT_ID -p "imbalance=[1-5]"
+    for (int imb : {1, 2, 3, 4, 5}) {
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_0, GGML_TYPE_F32, 32, 4, false, 1792, 5000, 2048, imb));
     }
 
 

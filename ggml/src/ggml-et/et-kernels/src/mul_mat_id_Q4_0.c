@@ -7,19 +7,20 @@
 //   ids: I32 [n_expert_used, batch]
 //   C: F32   [M, n_expert_used, batch]
 //
-// Strategy (V3, shire-aware partitioning + streaming pair-merge):
-//   - Each non-empty expert is pinned to a contiguous group of shires so its
-//     M dimension is split only across harts that share an L2. This lets the
-//     few token-pair activations (B columns for that expert's routings) live
-//     in the shire L2 once and be reused by all harts working on the same
-//     expert.
-//   - Case A (n_nonempty >= num_shires): each shire owns a contiguous block
-//     of experts.
-//   - Case B (n_nonempty <  num_shires): each expert is split across a
-//     contiguous group of shires, partitioned by m-pair.
-//   - Inside the shire, its 64 harts split the (owned_expert, m-pair) units
-//     linearly and run the streaming pair-merge over src2.
-//   - Assumes num_threads is an exact multiple of HARTS_PER_SHIRE.
+// Strategy (V4, work-balanced partitioning + streaming pair-merge):
+//   - Work unit = (non-empty expert, m-pair). Its cost is ~proportional to
+//     expert_cnt[e] (the streaming pair-merge touches every routing of that
+//     expert). The old V3 split EXPERTS evenly across shires, so the shire
+//     pinned to the hottest expert became a serial bottleneck under skewed
+//     MoE routing while the rest idled.
+//   - V4 instead gives every hart an equal share of WORK: it splits the unit
+//     stream by cumulative weight (sum of expert_cnt over a hart's units),
+//     resolved against a per-expert weight prefix. Each hart owns a contiguous
+//     [u_start, u_end) range, so a cold expert that fits in one hart-block stays
+//     L2-local, while a hot expert automatically fans out across many harts.
+//   - Locality bonus: at uniform load every expert weighs the same, so each
+//     expert lands on exactly HARTS_PER_SHIRE contiguous harts (one shire) —
+//     the same L2 reuse V3 had, but without the load imbalance.
 //******************************************************************************
 
 #include <stdint.h>
@@ -216,81 +217,53 @@ int entry_point(struct ggml_et_mul_mat_id_params* params, void* env) {
 
     if (n_nonempty == 0) return 0;
 
-    // ---- Shire-aware partitioning ----
-    // Assumes num_threads is an exact multiple of HARTS_PER_SHIRE (true on
-    // this hardware with the configured shire mask).
-    const int HARTS_PER_SHIRE = SOC_MINIONS_PER_SHIRE * NUM_HARTS_PER_MINION; // 64
-    const int     num_shires  = num_threads / HARTS_PER_SHIRE;
-    const int     my_shire    = thread_id / HARTS_PER_SHIRE;
-    const int     my_hart_id  = thread_id % HARTS_PER_SHIRE;
+    // ---- Work-balanced partitioning ----
+    // Unit = (non-empty expert, m-pair); its cost ~= expert_cnt[e] (the inner
+    // streaming pair-merge walks every routing of that expert). Give each hart
+    // an equal share of total WORK (= sum of expert_cnt over its units) instead
+    // of an equal count of experts, so a hot expert spreads across many harts.
     const int64_t m_pairs_per_expert = (M + 1) / 2;
+    const int64_t total_units        = (int64_t)n_nonempty * m_pairs_per_expert;
 
-    int64_t e_lo_idx, e_hi_idx; // range into nonempty[]
-    int64_t mp_lo,    mp_hi;    // m-pair range owned by this shire (case B)
+    // Total work weight W = sum_e expert_cnt[e] * m_pairs_per_expert.
+    int64_t W = 0;
+    for (int32_t i = 0; i < n_nonempty; i++) {
+        W += (int64_t)expert_cnt[nonempty[i]] * m_pairs_per_expert;
+    }
+    if (W == 0) return 0;
 
-    if (n_nonempty >= num_shires) {
-        // Case A: experts split across shires (balanced).
-        const int64_t base  = n_nonempty / num_shires;
-        const int64_t extra = n_nonempty % num_shires;
-        if ((int64_t)my_shire < extra) {
-            e_lo_idx = (int64_t)my_shire * (base + 1);
-            e_hi_idx = e_lo_idx + (base + 1);
-        } else {
-            e_lo_idx = extra * (base + 1) + ((int64_t)my_shire - extra) * base;
-            e_hi_idx = e_lo_idx + base;
-        }
-        mp_lo = 0;
-        mp_hi = m_pairs_per_expert;
-    } else {
-        // Case B: each expert owned by a group of contiguous shires.
-        const int64_t base_sh   = num_shires / n_nonempty;
-        const int64_t extra_sh  = num_shires % n_nonempty;
-        const int64_t big_block = (base_sh + 1) * extra_sh;
-        int64_t this_expert, shire_in_expert, shires_for_expert;
-        if ((int64_t)my_shire < big_block) {
-            this_expert       = (int64_t)my_shire / (base_sh + 1);
-            shire_in_expert   = (int64_t)my_shire % (base_sh + 1);
-            shires_for_expert = base_sh + 1;
-        } else {
-            const int64_t off = (int64_t)my_shire - big_block;
-            this_expert       = extra_sh + off / base_sh;
-            shire_in_expert   = off % base_sh;
-            shires_for_expert = base_sh;
-        }
-        e_lo_idx = this_expert;
-        e_hi_idx = this_expert + 1;
-        // Split m_pairs across this expert's shires.
-        const int64_t mp_base  = m_pairs_per_expert / shires_for_expert;
-        const int64_t mp_extra = m_pairs_per_expert % shires_for_expert;
-        if (shire_in_expert < mp_extra) {
-            mp_lo = shire_in_expert * (mp_base + 1);
-            mp_hi = mp_lo + (mp_base + 1);
-        } else {
-            mp_lo = mp_extra * (mp_base + 1) + (shire_in_expert - mp_extra) * mp_base;
-            mp_hi = mp_lo + mp_base;
+    // This hart owns the units whose cumulative weight lands in [tw_lo, tw_hi).
+    const int64_t tw_lo = ((int64_t)thread_id       * W) / (int64_t)num_threads;
+    const int64_t tw_hi = ((int64_t)(thread_id + 1) * W) / (int64_t)num_threads;
+
+    // Resolve each weight boundary to a unit-aligned global index
+    // u = nei * m_pairs_per_expert + mp, walking the per-expert weight prefix.
+    int64_t u_start = total_units;
+    int64_t u_end   = total_units;
+    {
+        int64_t acc = 0;
+        for (int32_t i = 0; i < n_nonempty; i++) {
+            const int64_t wpm  = (int64_t)expert_cnt[nonempty[i]]; // weight per m-pair
+            const int64_t wexp = wpm * m_pairs_per_expert;         // weight of whole expert
+            if (u_start == total_units && acc + wexp > tw_lo) {
+                u_start = (int64_t)i * m_pairs_per_expert + (tw_lo - acc) / wpm;
+            }
+            if (u_end == total_units && acc + wexp > tw_hi) {
+                u_end = (int64_t)i * m_pairs_per_expert + (tw_hi - acc) / wpm;
+                break;
+            }
+            acc += wexp;
         }
     }
-
-    const int64_t n_owned_experts = e_hi_idx - e_lo_idx;
-    const int64_t mp_span         = mp_hi - mp_lo;
-    const int64_t shire_units     = n_owned_experts * mp_span;
-    if (shire_units == 0) return 0;
-
-    const int64_t per_hart       = (shire_units + HARTS_PER_SHIRE - 1) / HARTS_PER_SHIRE;
-    const int64_t my_start_local = (int64_t)my_hart_id * per_hart;
-    if (my_start_local >= shire_units) return 0;
-    int64_t my_end_local = my_start_local + per_hart;
-    if (my_end_local > shire_units) my_end_local = shire_units;
+    if (u_start >= u_end) return 0;
 
     q4_dot_state q4_state;
     q4_dot_begin(&q4_state);
 
-    for (int64_t u = my_start_local; u < my_end_local; u++) {
-        const int64_t local_e = u / mp_span;
-        const int64_t local_m = u - local_e * mp_span;
-        const int32_t nei     = (int32_t)(e_lo_idx + local_e);
-        const int64_t mp      = mp_lo + local_m;
-        const int32_t e       = nonempty[nei];
+    for (int64_t u = u_start; u < u_end; u++) {
+        const int32_t nei = (int32_t)(u / m_pairs_per_expert);
+        const int64_t mp  = u - (int64_t)nei * m_pairs_per_expert;
+        const int32_t e   = nonempty[nei];
 
         const int64_t m0     = 2 * mp;
         const int64_t m1     = m0 + 1;
