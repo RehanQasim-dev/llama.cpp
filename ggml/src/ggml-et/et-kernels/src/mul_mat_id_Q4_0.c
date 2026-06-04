@@ -28,6 +28,7 @@
 #include "math_fp.h"
 #include "quants.h"
 #include "block_ops.h"
+#include <etsoc/common/utils.h>
 
 #define MAX_N_EXPERT 128
 
@@ -194,6 +195,20 @@ int entry_point(struct ggml_et_mul_mat_id_params* params, void* env) {
     int32_t n_nonempty = 0;
     for (int64_t e = 0; e < n_expert; e++) {
         if (expert_cnt[e] > 0) nonempty[n_nonempty++] = (int32_t)e;
+    }
+
+    // Debug: thread 0 has scanned the full src2, so it holds the complete
+    // per-expert token count. Print the routing distribution once (only the
+    // non-empty experts). The host only reads this trace back on the first
+    // mul_mat_id_Q4_0 launch (enable_print), so it prints exactly once.
+    if (thread_id == 0) {
+        et_printf("[mul_mat_id Q4_0] n_expert=%d n_expert_used=%d batch=%d total_routings=%d n_nonempty=%d\n",
+                  (int)n_expert, (int)n_expert_used, (int)batch,
+                  (int)(n_expert_used * batch), (int)n_nonempty);
+        for (int64_t i = 0; i < n_nonempty; i++) {
+            const int32_t e = nonempty[i];
+            et_printf("[mul_mat_id Q4_0] expert %d : %d tokens\n", (int)e, (int)expert_cnt[e]);
+        }
     }
 
     // Hart 0 zeros outputs of invalid routings (cheap, almost never hit).

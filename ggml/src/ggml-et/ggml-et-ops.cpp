@@ -881,6 +881,8 @@ bool ggml_et_op_mul_mat_id(ggml_backend_et_device_context* dev_ctx, const ggml_t
     const char* kernel_name;
     const char* src0_type_name;
 
+    bool is_q4_0 = false;
+
     // Support Q8_0/Q4_0/F16/F32 x F32 -> F32 matrix multiplication with expert selection
     if (node->type == GGML_TYPE_F32 &&
         node->src[0]->type == GGML_TYPE_Q8_0 &&
@@ -897,6 +899,7 @@ bool ggml_et_op_mul_mat_id(ggml_backend_et_device_context* dev_ctx, const ggml_t
 
         kernel_name = "mul_mat_id_Q4_0";
         src0_type_name = "Q4_0";
+        is_q4_0 = true;
 
     } else if (node->type == GGML_TYPE_F32 &&
                node->src[0]->type == GGML_TYPE_F16 &&
@@ -941,8 +944,14 @@ bool ggml_et_op_mul_mat_id(ggml_backend_et_device_context* dev_ctx, const ggml_t
         }
     }
 
-    // Launch ET kernel
-    bool kernel_result = ggml_et_launch_kernel(dev_ctx, kernel_name, &params, sizeof(params), 0xFFFFFFFF);
+    // Launch ET kernel.
+    // Debug: enable trace readback for the Q4_0 mul_mat_id kernel so the
+    // expert-routing distribution it prints (via et_printf on thread 0) is
+    // captured. The launch path writes it to the trace log file, titled with
+    // the kernel name. To trace any other kernel, just set enable_print=true on
+    // its launch and add a thread-0-guarded et_printf in it.
+    bool enable_print = is_q4_0;
+    bool kernel_result = ggml_et_launch_kernel(dev_ctx, kernel_name, &params, sizeof(params), 0xFFFFFFFF, enable_print);
 
     // Phase 2: Execute CPU computation and compare with ET result (after ET kernel)
     if (cpu_comparison_active) {

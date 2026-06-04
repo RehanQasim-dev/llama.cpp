@@ -5,12 +5,56 @@
 #include <fstream>
 #include <cstdlib>
 #include <cstring>
+#include <cstdio>
+#include <string>
+#include <sys/stat.h>
+#include <dirent.h>
 
 #define ET_TRACE_DECODER_IMPL
 #include <et-trace/decoder.h>
 #include <et-trace/layout.h>
 
 static constexpr size_t GGML_ET_UBERKERNEL_PARAM_ALIGN = 64;
+
+// ---- Debug kernel-trace logging --------------------------------------------
+// All decoded et_printf output is written to et_debug_logs/kernel_print_logs_N.txt
+// (created relative to the cwd / repo root). One file per process run: the index
+// auto-increments past any existing kernel_print_logs_* files. The file is opened
+// lazily on the first launch that actually produces trace data.
+static FILE* g_et_trace_log_file   = nullptr;
+static bool  g_et_trace_log_opened = false;
+
+static FILE* ggml_et_trace_log_get() {
+    if (g_et_trace_log_opened) {
+        return g_et_trace_log_file;
+    }
+    g_et_trace_log_opened = true;
+
+    const char* dir = "et_debug_logs";
+    mkdir(dir, 0755); // ignore failure (e.g. already exists)
+
+    int next = 1;
+    if (DIR* d = opendir(dir)) {
+        struct dirent* ent;
+        while ((ent = readdir(d)) != nullptr) {
+            int n = 0;
+            if (sscanf(ent->d_name, "kernel_print_logs_%d", &n) == 1 && n >= next) {
+                next = n + 1;
+            }
+        }
+        closedir(d);
+    }
+
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/kernel_print_logs_%d.txt", dir, next);
+    g_et_trace_log_file = fopen(path, "w");
+    if (g_et_trace_log_file) {
+        GGML_LOG_INFO("ET: writing kernel trace logs to %s\n", path);
+    } else {
+        GGML_LOG_ERROR("ET: failed to open trace log file %s\n", path);
+    }
+    return g_et_trace_log_file;
+}
 
 static size_t ggml_et_align_up(size_t value, size_t alignment) {
     return (value + alignment - 1) & ~(alignment - 1);
@@ -193,14 +237,17 @@ static bool ggml_et_launch_kernel_internal(ggml_backend_et_device_context* dev_c
         rt::KernelLaunchOptions k_opts;
         k_opts.setShireMask(shire_mask);  // Default: all shires (0xFFFFFFFF)
         k_opts.setBarrier(true);          // Wait for completion
-        k_opts.setFlushL3(false);         // No L3 flush needed
+        // When tracing is on, flush L3 so the kernel's trace-buffer writes are
+        // pushed to DRAM before we copy the buffer back (otherwise some
+        // readbacks see stale/partial data).
+        k_opts.setFlushL3(enable_print);
         if(enable_print) {
             k_opts.setUserTracing(
                 reinterpret_cast<uint64_t>(dev_ctx->trace_buffer),
                 static_cast<uint32_t>(ET_TRACE_BUFFER_SIZE),
                 0,                              // threshold
                 shire_mask,                     // shire mask
-                0xFFFFFFFFFFFFFFFFULL,          // threadMask — all threads
+                0x1ULL,                         // threadMask — hart 0 only (gets full buffer slice)
                 0xFFFFFFFFU,                    // eventMask — all events
                 0xFFFFFFFFU                     // filterMask — all levels
             );
@@ -228,12 +275,26 @@ static bool ggml_et_launch_kernel_internal(ggml_backend_et_device_context* dev_c
             runtime->waitForStream(dev_ctx->default_stream);
             const auto* traceHeader = reinterpret_cast<const trace_buffer_std_header_t*>(hostTraceBuf.data());
             const trace_entry_header_t* entry = nullptr;
+            std::string body;
+            char        line[1024];
             while ((entry = Trace_Decode(traceHeader, entry))) {
                 if (entry->type != TRACE_TYPE_STRING) {
                     continue;
                 }
                 const auto* strEntry = reinterpret_cast<const trace_string_t*>(entry);
-                printf("[hart %d] %s", entry->hart_id, strEntry->string);
+                snprintf(line, sizeof(line), "[hart %d] %s", entry->hart_id, strEntry->string);
+                body += line;
+            }
+            // Generic: title each block with the kernel name, then its captured
+            // output. Only emitted when this launch actually produced trace data,
+            // so silent launches add nothing to the file. Works for any kernel
+            // that calls et_printf (typically guarded on thread 0).
+            if (!body.empty()) {
+                if (FILE* lf = ggml_et_trace_log_get()) {
+                    fprintf(lf, "\n=== kernel %s ===\n", kernel_name.c_str());
+                    fputs(body.c_str(), lf);
+                    fflush(lf);
+                }
             }
         }
 
