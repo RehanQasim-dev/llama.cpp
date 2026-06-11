@@ -12,8 +12,8 @@
 //
 // Two execution paths (selected at runtime by N % TILE_N):
 //   * REUSE path  (N % TILE_N == 0): dequantize each weight K-window ONCE and
-//     reuse it across REUSE_N consecutive N-tiles, so the (producer-bound)
-//     dequant work is cut by ~REUSE_N. Partial C is round-tripped through an
+//     reuse it across ru_n consecutive N-tiles, so the (producer-bound)
+//     dequant work is cut by ~ru_n. Partial C is round-tripped through an
 //     L2-SCP scratch between K-windows (the FMA C accumulator is a single fixed
 //     register-file tile, so multiple output tiles cannot be resident at once).
 //   * ORIGINAL path (N % TILE_N != 0): one output tile at a time, no reuse.
@@ -26,13 +26,18 @@
 #define BLOCK_K QK4_0   // 32 elements per Q4_0 block
 #define FMA_K   16      // tensor FMA k-width for FP32 (a_num_cols = FMA_K-1)
 
-// --- Reuse knobs (compile-time; swept during tuning) ---------------------
-#ifndef REUSE_N
-#define REUSE_N 4       // N-tiles sharing one dequant (1 = no reuse)
+// --- Reuse knobs ----------------------------------------------------------
+// REUSE_MAX caps the L2-SCP C-scratch footprint; the actual reuse factor is
+// chosen at runtime (see ru_n) as the largest value that still keeps the whole
+// machine busy. KWIN is the dequant-cache depth (K-blocks per window).
+#ifndef REUSE_MAX
+#define REUSE_MAX 8
 #endif
 #ifndef KWIN
 #define KWIN    16      // K-blocks per dequant window (cache depth)
 #endif
+
+#define MACHINE_SLOTS (NUM_COMPUTE_SHIRES * MINIONS_PER_SHIRE)  // 1024
 
 #define CACHEOP_MAX 0
 #define REP_RATE    0
@@ -48,13 +53,13 @@
 // per-minion stride uses it for both paths (mutually exclusive at runtime).
 //   [0 .. RU_BUF_BYTES)            cache buffer 0 (KWIN panels)
 //   [RU_BUF_BYTES .. 2*..)         cache buffer 1 (KWIN panels)
-//   [RU_CACHE_BYTES .. +R*1024)    REUSE_N C-scratch tiles (16 rows*64B each)
+//   [RU_CACHE_BYTES .. +R*1024)    REUSE_MAX C-scratch tiles (16 rows*64B each)
 //   ready_ctr, consumed_ctr        sync counters
 // The ORIGINAL path reuses [0,2048) and [2048,4096) as its two panels and the
 // same ready/consumed counters (which sit above the cache region).
 #define RU_BUF_BYTES     (KWIN * SCP_PANEL_SIZE)
 #define RU_CACHE_BYTES   (2 * RU_BUF_BYTES)
-#define RU_CSCRATCH_BYTES (REUSE_N * 16 * 64ULL)
+#define RU_CSCRATCH_BYTES (REUSE_MAX * 16 * 64ULL)
 #define SCP_READY_OFF    (RU_CACHE_BYTES + RU_CSCRATCH_BYTES)
 #define SCP_CONSUMED_OFF (SCP_READY_OFF + 64)
 #define SCP_PER_MINION   (SCP_CONSUMED_OFF + 64)
@@ -249,10 +254,20 @@ int entry_point(struct ggml_et_binary_params *params, void *env) {
     volatile uint32_t *consumed_ctr =
         (volatile uint32_t *) et_shire_l2scp_local(scp_base + SCP_CONSUMED_OFF);
 
-    const int reuse_ok = (N % TILE_N == 0) && (REUSE_N > 0);
+    // Reuse factor: largest R that still keeps the machine busy (units =
+    // total_tiles / R >= MACHINE_SLOTS), capped by REUSE_MAX and n_tiles.
+    const int64_t total_tiles = m_tiles * n_tiles * batch_count;
+    int64_t ru_n = total_tiles / MACHINE_SLOTS;
+    if (ru_n > REUSE_MAX) ru_n = REUSE_MAX;
+    if (ru_n > n_tiles)   ru_n = n_tiles;
+    if (ru_n < 1)         ru_n = 1;
+
+    // Reuse pays only when it groups >=2 N-tiles; otherwise the windowing /
+    // C round-trip is pure overhead, so use the one-tile-at-a-time path.
+    const int reuse_ok = (N % TILE_N == 0) && (ru_n >= 2);
 
     // =====================================================================
-    // REUSE path: dequant each K-window once, reuse across REUSE_N N-tiles.
+    // REUSE path: dequant each K-window once, reuse across ru_n N-tiles.
     // =====================================================================
     if (reuse_ok) {
         char *cache_buf[2] = {
@@ -261,7 +276,7 @@ int entry_point(struct ggml_et_binary_params *params, void *env) {
         };
         char *cscratch = (char *) et_shire_l2scp_local(scp_base + RU_CACHE_BYTES);
 
-        const int64_t n_groups   = (n_tiles + REUSE_N - 1) / REUSE_N;
+        const int64_t n_groups   = (n_tiles + ru_n - 1) / ru_n;
         const int64_t units_pb   = m_tiles * n_groups;
         const int64_t base_units = units_pb * batch_count;
         const int64_t n_windows  = (k_steps + KWIN - 1) / KWIN;
@@ -332,9 +347,9 @@ int entry_point(struct ggml_et_binary_params *params, void *env) {
             char       *dst_batch  = dst_base  + i3 * nb3_d + i2 * nb2_d;
 
             const int64_t mb        = mb_idx * TILE_M;
-            const int64_t nb_base_t = g_idx * REUSE_N;                 // first N-tile
+            const int64_t nb_base_t = g_idx * ru_n;                    // first N-tile
             int64_t r_count = n_tiles - nb_base_t;
-            if (r_count > REUSE_N) r_count = REUSE_N;
+            if (r_count > ru_n) r_count = ru_n;
 
             for (int64_t kw = 0; kw < n_windows; ++kw) {
                 const int buf = wid & 1;
