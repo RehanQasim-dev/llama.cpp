@@ -337,21 +337,16 @@ int entry_point(struct ggml_et_binary_params *params, void *env) {
                     0
                 );
 
-                // Load B (dequantized weights) half from L2 SCP panel, PLAIN.
-                tensor_load(
-                    false, false,
-                    B_L1_START,
-                    TENSOR_LOAD_PLAIN,
-                    0,
+                tensor_wait(TENSOR_LOAD_WAIT_0);
+
+                // Load B (dequantized weights) half from L2 SCP panel directly to TenB buffer.
+                tensor_load_setup_b(
+                    false,
                     (uint64_t)(scp_panel[buf] + (int64_t) half * FMA_K * TILE_M),
-                    0,
                     FMA_K - 1,
                     64,
                     1
                 );
-
-                tensor_wait(TENSOR_LOAD_WAIT_0);
-                tensor_wait(TENSOR_LOAD_WAIT_1);
 
                 tensor_fma(
                     false,
@@ -362,7 +357,7 @@ int entry_point(struct ggml_et_binary_params *params, void *env) {
                     false,
                     false,
                     false,
-                    false,
+                    true,           // tenb_loc = true (use TenB buffer)
                     B_L1_START,
                     A_L1_START,
                     TENSOR_FMA_OP_FP32,
