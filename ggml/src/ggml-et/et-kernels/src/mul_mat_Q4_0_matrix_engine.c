@@ -254,51 +254,28 @@ int entry_point(struct ggml_et_binary_params *params, void *env) {
     volatile uint32_t *consumed_ctr =
         (volatile uint32_t *) et_shire_l2scp_local(scp_base + SCP_CONSUMED_OFF);
 
-    // Reuse factor: largest R that still keeps the machine busy (units =
-    // total_tiles / R >= MACHINE_SLOTS), capped by REUSE_MAX and n_tiles.
-    const int64_t total_tiles = m_tiles * n_tiles * batch_count;
-    #ifndef UTIL_THRESHOLD
-    #define UTIL_THRESHOLD 75
-    #endif
+    // Calculate ru_n to perfectly minimize hardware waves while avoiding Consumer bottleneck.
+    // The pipeline is perfectly balanced at r=8. Score = waves * max(8, r).
+    // We find the r that minimizes Score.
+    int64_t best_r = 1;
+    int64_t min_score = INT64_MAX;
+    int64_t max_search_r = REUSE_MAX;
+    if (max_search_r > n_tiles) max_search_r = n_tiles;
 
-    int64_t best_ru_n = REUSE_MAX;
-    if (best_ru_n > n_tiles) best_ru_n = n_tiles;
-    if (best_ru_n < 1)       best_ru_n = 1;
-    
-    int64_t max_util = 0;
-    int64_t fallback_ru_n = best_ru_n;
-
-    for (int64_t r = REUSE_MAX; r >= 2; --r) {
-        if (r > n_tiles) continue;
-        
-        int64_t test_n_groups = (n_tiles + r - 1) / r;
-        int64_t base_units    = m_tiles * test_n_groups * batch_count;
-        int64_t total_waves   = (base_units + MACHINE_SLOTS - 1) / MACHINE_SLOTS;
-        int64_t total_slots   = total_waves * MACHINE_SLOTS;
-        
-        int64_t util = (base_units * 100) / total_slots;
-        
-        if (util >= UTIL_THRESHOLD) {
-            best_ru_n = r;
-            break;
-        }
-        
-        if (util > max_util) {
-            max_util = util;
-            fallback_ru_n = r;
-        }
-    }
-    
-    int64_t ru_n = best_ru_n;
-    if (ru_n == REUSE_MAX && max_util > 0) {
-        int64_t n_groups = (n_tiles + best_ru_n - 1) / best_ru_n;
+    for (int64_t r = 1; r <= max_search_r; r++) {
+        int64_t n_groups = (n_tiles + r - 1) / r;
         int64_t base_units = m_tiles * n_groups * batch_count;
-        int64_t total_waves = (base_units + MACHINE_SLOTS - 1) / MACHINE_SLOTS;
-        int64_t total_slots = total_waves * MACHINE_SLOTS;
-        if ((base_units * 100) / total_slots < UTIL_THRESHOLD) {
-            ru_n = fallback_ru_n;
+        int64_t waves = (base_units + MACHINE_SLOTS - 1) / MACHINE_SLOTS;
+        
+        int64_t penalty = (r > 8) ? r : 8;
+        int64_t score = waves * penalty;
+        
+        if (score < min_score) {
+            min_score = score;
+            best_r = r;
         }
     }
+    int64_t ru_n = best_r;
 
     // Reuse pays only when it groups >=2 N-tiles; otherwise the windowing /
     // C round-trip is pure overhead, so use the one-tile-at-a-time path.
