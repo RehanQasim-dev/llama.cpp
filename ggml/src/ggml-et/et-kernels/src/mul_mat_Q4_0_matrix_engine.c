@@ -31,7 +31,7 @@
 // chosen at runtime (see ru_n) as the largest value that still keeps the whole
 // machine busy. KWIN is the dequant-cache depth (K-blocks per window).
 #ifndef REUSE_MAX
-#define REUSE_MAX 8
+#define REUSE_MAX 15
 #endif
 #ifndef KWIN
 #define KWIN    16      // K-blocks per dequant window (cache depth)
