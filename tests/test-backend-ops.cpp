@@ -8091,6 +8091,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 test_cases.emplace_back(new test_mul_mat(type_a, type_b, 16, 16, k, {3, 2}, {1, 2}));
                 test_cases.emplace_back(new test_mul_mat(type_a, type_b, 16, 16, k, {3, 2}, {2, 2}));
 
+                // REUSE-path coverage: Q4_0 matrix engine. Needs enough tiles
+                // for the adaptive reuse factor to pick ru_n>=2 (total_tiles >=
+                // MACHINE_SLOTS), and k=1024 to span >1 K-window (C seed/spill).
+                if (type_a == GGML_TYPE_Q4_0 && type_b == GGML_TYPE_F32) {
+                    test_cases.emplace_back(new test_mul_mat(type_a, type_b, 4096, 256,  256, {1, 1}, {1, 1})); // ru_n=4, 1 window
+                    test_cases.emplace_back(new test_mul_mat(type_a, type_b, 4096, 256, 1024, {1, 1}, {1, 1})); // ru_n=4, 2 windows
+                    test_cases.emplace_back(new test_mul_mat(type_a, type_b, 4096, 128, 1024, {1, 1}, {1, 1})); // ru_n=2, 2 windows
+                }
+
                 // test cases with permutation
                 test_cases.emplace_back(new test_mul_mat(type_a, type_b, 16,  1, k, {2, 3}, {1, 1}, {0, 2, 1, 3}));
                 test_cases.emplace_back(new test_mul_mat(type_a, type_b, 16,  1, k, {2, 3}, {1, 1}, {0, 1, 3, 2}));
@@ -8903,10 +8912,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_cumsum(GGML_TYPE_F32, { 2048, 16, 5, 4 }));
     test_cases.emplace_back(new test_cumsum(GGML_TYPE_F32, { 20000, 10, 4, 1 }));
 
-    for (int bs : {1, 2, 3, 4, 5, 8, 512}) {
-        for (ggml_type type_a : all_types) {
+    for (int bs : {1, 4, 8, 15, 32, 33, 64, 65, 127, 128, 256, 512, 766, 1000, 1500, 2000, 3000, 4000, 5000, 6000, 7000, 8000}) {
+        for (ggml_type type_a : {GGML_TYPE_Q4_0}) {
             for (ggml_type type_b : {GGML_TYPE_F32}) {
-                test_cases.emplace_back(new test_mul_mat(type_a, type_b, 4096, bs, 14336, {1,  1}, {1, 1}));
+                test_cases.emplace_back(new test_mul_mat(type_a, type_b, 4096, bs, 4096, {1,  1}, {1, 1}));
             }
         }
     }

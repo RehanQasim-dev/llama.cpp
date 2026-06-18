@@ -264,7 +264,7 @@ int entry_point(struct ggml_et_binary_params *params, void *env) {
 
     // Reuse pays only when it groups >=2 N-tiles; otherwise the windowing /
     // C round-trip is pure overhead, so use the one-tile-at-a-time path.
-    const int reuse_ok = (N % TILE_N == 0) && (ru_n >= 2);
+    const int reuse_ok = (ru_n >= 2);
 
     // =====================================================================
     // REUSE path: dequant each K-window once, reuse across ru_n N-tiles.
@@ -362,11 +362,21 @@ int entry_point(struct ggml_et_binary_params *params, void *env) {
                 float *cf = (float *) cache_buf[buf];
 
                 for (int64_t r = 0; r < r_count; ++r) {
-                    const int64_t nb = (nb_base_t + r) * TILE_N;       // full tile (N%16==0)
+                    const int64_t nb = (nb_base_t + r) * TILE_N;
+                    const int64_t n_cur = (nb + TILE_N <= N) ? TILE_N : (N - nb);
+                    const int64_t arows_fma = (n_cur == 4) ? 4 : (n_cur - 1);
+
                     char *cs = cscratch + r * (16 * 64);
 
                     if (kw > 0) c_seed(cs);
                     int first = (kw == 0) ? 1 : 0;
+
+                    if (n_cur == 4) {
+                        static const float __attribute__((aligned(64))) zero_line[16] = {0};
+                        tensor_load(false, false, A_L1_START + 4, TENSOR_LOAD_PLAIN, 0,
+                                    (uint64_t) zero_line, 0, 0, 64, 0);
+                        tensor_wait(TENSOR_LOAD_WAIT_0);
+                    }
 
                     for (int64_t i = 0; i < kbn; ++i) {
                         for (int half = 0; half < 2; ++half) {
@@ -374,7 +384,7 @@ int entry_point(struct ggml_et_binary_params *params, void *env) {
                             tensor_load(
                                 false, false, A_L1_START, TENSOR_LOAD_PLAIN, 0,
                                 (uint64_t)(src1_batch + nb * nb1_1 + k_elem * (int64_t) sizeof(float)),
-                                0, TILE_N - 1, (uint64_t) nb1_1, 0);
+                                0, n_cur - 1, (uint64_t) nb1_1, 0);
                             tensor_wait(TENSOR_LOAD_WAIT_0);
 
                             tensor_load_setup_b(
@@ -383,7 +393,7 @@ int entry_point(struct ggml_et_binary_params *params, void *env) {
                                 FMA_K - 1, 64, 1);
 
                             tensor_fma(
-                                false, 3, TILE_N - 1, FMA_K - 1, 0,
+                                false, 3, arows_fma, FMA_K - 1, 0,
                                 false, false, false, true,
                                 B_L1_START, A_L1_START, TENSOR_FMA_OP_FP32, first);
                             tensor_wait(TENSOR_FMA_WAIT);
@@ -393,7 +403,7 @@ int entry_point(struct ggml_et_binary_params *params, void *env) {
 
                     if (is_last) {
                         tensor_store(
-                            0, 0, 3, TILE_N - 1,
+                            0, 0, 3, n_cur - 1,
                             (uint64_t)(dst_batch + nb * nb1_d + mb * (int64_t) sizeof(float)),
                             0, (uint64_t) nb1_d);
                         tensor_wait(TENSOR_STORE_WAIT);
