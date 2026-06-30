@@ -61,8 +61,17 @@
 #define CACHEOP_MAX 0
 #define REP_RATE    0
 
-#define A_L1_START 0    // L1 SCP lines  0..15 for A (activations)
+// L1-SCP (3 KB = 48 lines, Hart 0 only) layout. The consumer double-buffers the
+// activation A-tile to software-pipeline the A tensor_load with the FMA (the
+// next A-tile loads while the current FMA runs). B streams via TenB (setup_b),
+// for which the FMA waits internally (TFMA_WAIT_TENB) — it needs no load slot,
+// leaving load slot 0 free for the A prefetch.
+//   lines  0..15 : A buffer 0      (A_L1_START)
+//   lines 16..31 : B panel         (B_L1_START)
+//   lines 32..47 : A buffer 1      (A_L1_ALT)
+#define A_L1_START 0    // L1 SCP lines  0..15 for A (activations), buffer 0
 #define B_L1_START 16   // L1 SCP lines 16..31 for B (dequantized weights)
+#define A_L1_ALT   32   // L1 SCP lines 32..47 for A (activations), buffer 1
 
 // Single dequant panel: BLOCK_K k-lines x TILE_M m (FP32) = 32*64 = 2048 bytes,
 // [k][m] order: panel[k*TILE_M + m].
@@ -413,9 +422,11 @@ int entry_point(struct ggml_et_binary_params *params, void *env) {
                 const int is_last = (kw == n_windows - 1);
                 float *cf = (float *) cache_buf[buf];
 
-#if STUB_CONSUMER
-                (void) cf; (void) is_last;
-#else
+                // STUB_CONSUMER: do only 1 FMA block (not all kbn) but keep the
+                // store/reduce so the engine drains and the kernel completes ->
+                // measures the producer-bound ceiling. !STUB: full kbn.
+                const int64_t kbn_c = STUB_CONSUMER ? 1 : kbn;
+
                 for (int64_t r = 0; r < r_count; ++r) {
                     const int64_t nb = (nb_base_t + r) * TILE_N;
                     const int64_t n_cur = (nb + TILE_N <= N) ? TILE_N : (N - nb);
@@ -427,34 +438,53 @@ int entry_point(struct ggml_et_binary_params *params, void *env) {
                     int first = (kw == 0) ? 1 : 0;
 
                     if (n_cur == 4) {
+                        // Errata-D: present AROWS=4 by zero-padding row 4 in BOTH
+                        // double-buffered A regions (the FMA reads from either).
                         static const float __attribute__((aligned(64))) zero_line[16] = {0};
                         tensor_load(false, false, A_L1_START + 4, TENSOR_LOAD_PLAIN, 0,
                                     (uint64_t) zero_line, 0, 0, 64, 0);
                         tensor_wait(TENSOR_LOAD_WAIT_0);
+                        tensor_load(false, false, A_L1_ALT + 4, TENSOR_LOAD_PLAIN, 0,
+                                    (uint64_t) zero_line, 0, 0, 64, 0);
+                        tensor_wait(TENSOR_LOAD_WAIT_0);
                     }
 
-                    for (int64_t i = 0; i < kbn; ++i) {
-                        for (int half = 0; half < 2; ++half) {
-                            const int64_t k_elem = (kb0 + i) * BLOCK_K + half * FMA_K;
-                            tensor_load(
-                                false, false, A_L1_START, TENSOR_LOAD_PLAIN, 0,
-                                (uint64_t)(src1_batch + nb * nb1_1 + k_elem * (int64_t) sizeof(float)),
-                                0, n_cur - 1, (uint64_t) nb1_1, 0);
-                            tensor_wait(TENSOR_LOAD_WAIT_0);
+                    // Software-pipelined activation prefetch: each "step" is one
+                    // 16-wide A-tile + FMA. While FMA[step] runs, A[step+1] is
+                    // loaded into the alternate L1 buffer (slot 0), hiding the
+                    // A-load latency. FMAs stay serial (same C accumulator).
+                    const int64_t nsteps = kbn_c * 2;
+#define A_TILE_ADDR(st)                                                                  \
+    ((uint64_t)(src1_batch + nb * nb1_1 +                                                \
+        (((kb0 + (st) / 2) * BLOCK_K) + ((st) % 2) * FMA_K) * (int64_t) sizeof(float)))
+                    // prologue: load step 0 into A buffer 0
+                    tensor_load(false, false, A_L1_START, TENSOR_LOAD_PLAIN, 0,
+                                A_TILE_ADDR(0), 0, n_cur - 1, (uint64_t) nb1_1, 0);
+                    for (int64_t s = 0; s < nsteps; ++s) {
+                        const uint64_t a_cur = (s & 1) ? A_L1_ALT : A_L1_START;
 
-                            tensor_load_setup_b(
-                                false,
-                                (uint64_t)(cf + i * (SCP_PANEL_SIZE / 4) + half * FMA_K * TILE_M),
-                                FMA_K - 1, 64, 1);
+                        tensor_wait(TENSOR_LOAD_WAIT_0);  // A[step] ready
 
-                            tensor_fma(
-                                false, 3, arows_fma, FMA_K - 1, 0,
-                                false, false, false, true,
-                                B_L1_START, A_L1_START, TENSOR_FMA_OP_FP32, first);
-                            tensor_wait(TENSOR_FMA_WAIT);
-                            first = 0;
+                        if (s + 1 < nsteps) {             // prefetch A[step+1]
+                            const uint64_t a_nxt = ((s + 1) & 1) ? A_L1_ALT : A_L1_START;
+                            tensor_load(false, false, a_nxt, TENSOR_LOAD_PLAIN, 0,
+                                        A_TILE_ADDR(s + 1), 0, n_cur - 1, (uint64_t) nb1_1, 0);
                         }
+
+                        const int64_t i = s / 2, half = s % 2;
+                        tensor_load_setup_b(
+                            false,
+                            (uint64_t)(cf + i * (SCP_PANEL_SIZE / 4) + half * FMA_K * TILE_M),
+                            FMA_K - 1, 64, 1);
+
+                        tensor_fma(
+                            false, 3, arows_fma, FMA_K - 1, 0,
+                            false, false, false, true,
+                            B_L1_START, a_cur, TENSOR_FMA_OP_FP32, first);
+                        tensor_wait(TENSOR_FMA_WAIT);
+                        first = 0;
                     }
+#undef A_TILE_ADDR
 
                     if (is_last) {
                         // C now holds this minion's partial sum over its K-split
@@ -486,7 +516,6 @@ int entry_point(struct ggml_et_binary_params *params, void *env) {
                         c_spill(cs);
                     }
                 }
-#endif
                 scp_signal(consumed_ctr, wid);
             }
         }
