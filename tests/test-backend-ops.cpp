@@ -8018,6 +8018,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gla(GGML_TYPE_F32, 32, 64, 32, 4));
     test_cases.emplace_back(new test_gla(GGML_TYPE_F32, 32, 64, 128, 4));
 
+    // Perfect wave tests for Q4_0 reuse optimization
+    for (int r = 2; r <= 15; r++) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 4096, 64 * r, 4096, {1, 1}, {1, 1}));
+    }
+
+    // Q4_0 tensor-engine target shapes (incl. partial-N: 700->n_cur=12, 900->n_cur=4 errata)
+    for (int64_t km : {2048, 4096}) {
+        for (int n : {256, 512, 700, 900}) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, km, n, km, {1, 1}, {1, 1}));
+        }
+    }
+
     // Qwen3 8B dense (Q8_0 weights × F32 activations) — catches regressions in
     // ET backend mul_mat Q8_0 kernel across GEMV (n=1) and large-N prefill paths.
     // hidden=4096, intermediate=12288, q_heads=32, kv_heads=8, head_dim=128.
@@ -8912,11 +8924,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_cumsum(GGML_TYPE_F32, { 2048, 16, 5, 4 }));
     test_cases.emplace_back(new test_cumsum(GGML_TYPE_F32, { 20000, 10, 4, 1 }));
 
-    for (int bs : {1, 4, 8, 15, 32, 33, 64, 65, 127, 128, 256, 512, 766, 1000, 1500, 2000, 3000, 4000, 5000, 6000, 7000, 8000}) {
-        for (ggml_type type_a : {GGML_TYPE_Q4_0}) {
-            for (ggml_type type_b : {GGML_TYPE_F32}) {
-                test_cases.emplace_back(new test_mul_mat(type_a, type_b, 4096, bs, 4096, {1,  1}, {1, 1}));
-            }
+    // Q4_0 tensor-engine GEMM sweep: N in {256,512,700,900}, (K,M) in {(2048,2048),(4096,4096)}
+    for (int64_t km : {2048, 4096}) {
+        for (int n : {256, 512, 700, 900}) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, km, n, km, {1, 1}, {1, 1}));
         }
     }
 

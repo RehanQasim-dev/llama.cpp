@@ -10,13 +10,15 @@
 // Hart 1: dequantize Q4_0 weights to FP32 into double-buffered L2 SCP.
 // Hart 0: tensor engine compute (FMA, reduce, store).
 //
-// Two execution paths (selected at runtime by N % TILE_N):
-//   * REUSE path  (N % TILE_N == 0): dequantize each weight K-window ONCE and
-//     reuse it across ru_n consecutive N-tiles, so the (producer-bound)
-//     dequant work is cut by ~ru_n. Partial C is round-tripped through an
-//     L2-SCP scratch between K-windows (the FMA C accumulator is a single fixed
-//     register-file tile, so multiple output tiles cannot be resident at once).
-//   * ORIGINAL path (N % TILE_N != 0): one output tile at a time, no reuse.
+// Two execution paths:
+//   * REUSE path (n_tiles >= 2): static MAXIMUM balanced reuse — dequantize each
+//     weight K-window ONCE and reuse it across ru_n N-tiles, cutting producer
+//     dequant work by ~ru_n. Under-full waves from high reuse are recovered by
+//     K-SPLITTING: the K dimension is split across an intra-shire minion group
+//     and the partial C summed with a tensor ring-reduce. Partial C is
+//     round-tripped through L2-SCP between K-windows (the FMA C accumulator is a
+//     single register-file tile, so multiple output tiles cannot be resident).
+//   * ORIGINAL path (n_tiles == 1, GEMV): one output tile at a time, no reuse.
 
 #define NUM_COMPUTE_SHIRES 32
 #define MINIONS_PER_SHIRE  32
@@ -27,14 +29,31 @@
 #define FMA_K   16      // tensor FMA k-width for FP32 (a_num_cols = FMA_K-1)
 
 // --- Reuse knobs ----------------------------------------------------------
-// REUSE_MAX caps the L2-SCP C-scratch footprint; the actual reuse factor is
-// chosen at runtime (see ru_n) as the largest value that still keeps the whole
-// machine busy. KWIN is the dequant-cache depth (K-blocks per window).
+// REUSE_MAX caps the L2-SCP C-scratch footprint (live-C working set), bounding
+// the maximum reuse factor; ru_n is then the balanced max reuse for the shape.
+// KWIN is the dequant-cache depth (K-blocks per window).
+// Joint scratchpad budget per minion is ~81920 B:
+//   2*KWIN*SCP_PANEL_SIZE (double-buffered window) + REUSE_MAX*1024 (live-C) + ctrs.
+// Static max reuse is the primary lever (§1), so we bias the budget toward a large
+// REUSE_MAX; K-splitting (§8) shrinks each minion's K-range, so a modest KWIN still
+// covers a split in few windows. KWIN=8, REUSE_MAX=32 -> 2*8*2048 + 32*1024 = 65664 B.
 #ifndef REUSE_MAX
-#define REUSE_MAX 15
+#define REUSE_MAX 32
 #endif
 #ifndef KWIN
-#define KWIN    16      // K-blocks per dequant window (cache depth)
+#define KWIN    8       // K-blocks per dequant window (cache depth)
+#endif
+
+// --- Bottleneck stub test (guidelines §6) ---------------------------------
+// Replace one path with a minimum-work stub that keeps the pipeline turning as
+// fast as possible (wrong result, throughput only). Build with -DSTUB_PRODUCER=1
+// or -DSTUB_CONSUMER=1 and compare throughput against the real build to find the
+// bottleneck for the target shape. Never enable both at once for a real run.
+#ifndef STUB_PRODUCER
+#define STUB_PRODUCER 0
+#endif
+#ifndef STUB_CONSUMER
+#define STUB_CONSUMER 0
 #endif
 
 #define MACHINE_SLOTS (NUM_COMPUTE_SHIRES * MINIONS_PER_SHIRE)  // 1024
@@ -242,11 +261,6 @@ int entry_point(struct ggml_et_binary_params *params, void *env) {
 
     const int64_t k_steps = K / BLOCK_K;        // number of Q4_0 blocks
 
-    const int64_t tiles_per_shire = MINIONS_PER_SHIRE;
-    const int64_t local_tile_idx  = local_minion;
-    const int64_t tiles_stride    = (int64_t) NUM_COMPUTE_SHIRES * tiles_per_shire;
-    const int64_t my_start        = (int64_t) shire_id + local_tile_idx * NUM_COMPUTE_SHIRES;
-
     // L2 SCP pointers for this minion.
     const uint64_t scp_base = local_minion * SCP_PER_MINION;
     volatile uint32_t *ready_ctr =
@@ -254,31 +268,48 @@ int entry_point(struct ggml_et_binary_params *params, void *env) {
     volatile uint32_t *consumed_ctr =
         (volatile uint32_t *) et_shire_l2scp_local(scp_base + SCP_CONSUMED_OFF);
 
-    // Calculate ru_n to perfectly minimize hardware waves while avoiding Consumer bottleneck.
-    // The pipeline is perfectly balanced at r=8. Score = waves * max(8, r).
-    // We find the r that minimizes Score.
-    int64_t best_r = 1;
-    int64_t min_score = INT64_MAX;
-    int64_t max_search_r = REUSE_MAX;
-    if (max_search_r > n_tiles) max_search_r = n_tiles;
+    // --- Static maximum reuse (§1), balanced (§8) ----------------------------
+    // Reuse one prepared w_tile set across as many N-tiles as the live-C scratch
+    // budget (REUSE_MAX) allows -> fewest N-groups. Then spread the N-tiles evenly
+    // over those groups (ru_n = ceil/n_groups) so every work unit does the same
+    // amount of consumer work (no straggler unit). No wave-fill penalty: the
+    // under-full waves that high reuse creates are recovered by K-splitting (§8).
+    int64_t n_groups = (n_tiles + REUSE_MAX - 1) / REUSE_MAX;
+    if (n_groups < 1) n_groups = 1;
+    int64_t ru_n = (n_tiles + n_groups - 1) / n_groups;
+    if (ru_n < 1) ru_n = 1;
 
-    for (int64_t r = 1; r <= max_search_r; r++) {
-        int64_t n_groups = (n_tiles + r - 1) / r;
-        int64_t base_units = m_tiles * n_groups * batch_count;
-        int64_t waves = (base_units + MACHINE_SLOTS - 1) / MACHINE_SLOTS;
-        
-        int64_t penalty = (r > 8) ? r : 8;
-        int64_t score = waves * penalty;
-        
-        if (score < min_score) {
-            min_score = score;
-            best_r = r;
+    const int64_t units_pb   = m_tiles * n_groups;
+    const int64_t base_units = units_pb * batch_count;
+
+    // --- K-splitting the under-full wave (§8) --------------------------------
+    // If the work units don't fill the ~1024 core slots, split the K dimension
+    // across an intra-shire minion group and sum the partial C with a tensor
+    // ring-reduce. k_splits is a power of two so it divides MINIONS_PER_SHIRE
+    // (group stays intra-shire) and k_steps (even K division); it is grown only
+    // while it does not overshoot a single wave (base_units*ks <= slots).
+    int64_t k_splits = 1;
+    {
+        int64_t ks = 1;
+        while (ks * 2 <= MINIONS_PER_SHIRE &&
+               base_units * ks * 2 <= MACHINE_SLOTS &&
+               (k_steps % (ks * 2)) == 0) {
+            ks *= 2;
         }
+        k_splits = ks;
     }
-    int64_t ru_n = best_r;
 
-    // Reuse pays only when it groups >=2 N-tiles; otherwise the windowing /
-    // C round-trip is pure overhead, so use the one-tile-at-a-time path.
+    const int64_t tiles_per_shire = MINIONS_PER_SHIRE / k_splits;
+    const int64_t k_split         = local_minion % k_splits;
+    const int64_t local_tile_idx  = local_minion / k_splits;
+    const int64_t tiles_stride    = (int64_t) NUM_COMPUTE_SHIRES * tiles_per_shire;
+    const int64_t my_start        = (int64_t) shire_id + local_tile_idx * NUM_COMPUTE_SHIRES;
+
+    const int64_t k_steps_per_split = k_steps / k_splits;
+    const int64_t k_start_block     = k_split * k_steps_per_split;
+
+    // Reuse pays only when it groups >=2 N-tiles; otherwise (GEMV, n_tiles==1)
+    // fall back to the one-tile-at-a-time ORIGINAL path.
     const int reuse_ok = (ru_n >= 2);
 
     // =====================================================================
@@ -291,10 +322,9 @@ int entry_point(struct ggml_et_binary_params *params, void *env) {
         };
         char *cscratch = (char *) et_shire_l2scp_local(scp_base + RU_CACHE_BYTES);
 
-        const int64_t n_groups   = (n_tiles + ru_n - 1) / ru_n;
-        const int64_t units_pb   = m_tiles * n_groups;
-        const int64_t base_units = units_pb * batch_count;
-        const int64_t n_windows  = (k_steps + KWIN - 1) / KWIN;
+        // Windows now cover only this minion's K-split range [k_start_block, +k_steps_per_split).
+        const int64_t k_end_block = k_start_block + k_steps_per_split;
+        const int64_t n_windows   = (k_steps_per_split + KWIN - 1) / KWIN;
 
         // ----- Hart 1: producer -----
         if (is_hart1) {
@@ -319,9 +349,10 @@ int entry_point(struct ggml_et_binary_params *params, void *env) {
                     const int buf = wid & 1;
                     if (wid >= 2) scp_wait(consumed_ctr, wid - 1);
 
-                    const int64_t kb0 = kw * KWIN;
-                    const int64_t kbn = (kb0 + KWIN <= k_steps) ? KWIN : (k_steps - kb0);
+                    const int64_t kb0 = k_start_block + kw * KWIN;
+                    const int64_t kbn = (kb0 + KWIN <= k_end_block) ? KWIN : (k_end_block - kb0);
 
+#if !STUB_PRODUCER
                     float *cf = (float *) cache_buf[buf];
                     for (int64_t i = 0; i < kbn; ++i) {
                         dequant_q4_0_panel(cf + i * (SCP_PANEL_SIZE / 4),
@@ -330,6 +361,9 @@ int entry_point(struct ggml_et_binary_params *params, void *env) {
                     FENCE;
                     flush_to_l2(cache_buf[buf], kbn * BLOCK_K, 64);
                     WAIT_CACHEOPS;
+#else
+                    (void) kbn;
+#endif
 
                     wid++;
                     scp_signal(ready_ctr, wid);
@@ -347,6 +381,9 @@ int entry_point(struct ggml_et_binary_params *params, void *env) {
         CLEAR_TENSOR_ERROR;
         evict_to_l2((const void *) ready_ctr, 1, 64);    WAIT_CACHEOPS;
         evict_to_l2((const void *) consumed_ctr, 1, 64); WAIT_CACHEOPS;
+
+        // First (global) minion id of this K-split group, for the ring-reduce.
+        const uint64_t group_base_global = get_minion_id() - (uint64_t) k_split;
 
         uint32_t wid = 0;
         for (int64_t unit = my_start; unit < base_units; unit += tiles_stride) {
@@ -371,11 +408,14 @@ int entry_point(struct ggml_et_binary_params *params, void *env) {
                 wid++;
                 scp_wait(ready_ctr, wid);
 
-                const int64_t kb0 = kw * KWIN;
-                const int64_t kbn = (kb0 + KWIN <= k_steps) ? KWIN : (k_steps - kb0);
+                const int64_t kb0 = k_start_block + kw * KWIN;
+                const int64_t kbn = (kb0 + KWIN <= k_end_block) ? KWIN : (k_end_block - kb0);
                 const int is_last = (kw == n_windows - 1);
                 float *cf = (float *) cache_buf[buf];
 
+#if STUB_CONSUMER
+                (void) cf; (void) is_last;
+#else
                 for (int64_t r = 0; r < r_count; ++r) {
                     const int64_t nb = (nb_base_t + r) * TILE_N;
                     const int64_t n_cur = (nb + TILE_N <= N) ? TILE_N : (N - nb);
@@ -417,15 +457,36 @@ int entry_point(struct ggml_et_binary_params *params, void *env) {
                     }
 
                     if (is_last) {
-                        tensor_store(
-                            0, 0, 3, n_cur - 1,
-                            (uint64_t)(dst_batch + nb * nb1_d + mb * (int64_t) sizeof(float)),
-                            0, (uint64_t) nb1_d);
-                        tensor_wait(TENSOR_STORE_WAIT);
+                        // C now holds this minion's partial sum over its K-split
+                        // range. Sum the K-split group's partials with a tensor
+                        // ring-reduce (§8): linear chain g0 -> g1 -> ... -> g(last),
+                        // each recv+FADDs its predecessor then forwards; only the
+                        // last minion holds the full sum and stores it.
+                        if (k_splits > 1) {
+                            const uint64_t num_regs = (uint64_t) n_cur * 2;
+                            if (k_split > 0) {
+                                tensor_reduce_recv(0, TENSOR_REDUCE_OP_FADD, num_regs,
+                                                   group_base_global + (uint64_t)(k_split - 1));
+                                tensor_wait(TENSOR_REDUCE_WAIT);
+                            }
+                            if (k_split < k_splits - 1) {
+                                tensor_reduce_send(0, num_regs,
+                                                   group_base_global + (uint64_t)(k_split + 1));
+                                tensor_wait(TENSOR_REDUCE_WAIT);
+                            }
+                        }
+                        if (k_split == k_splits - 1) {
+                            tensor_store(
+                                0, 0, 3, n_cur - 1,
+                                (uint64_t)(dst_batch + nb * nb1_d + mb * (int64_t) sizeof(float)),
+                                0, (uint64_t) nb1_d);
+                            tensor_wait(TENSOR_STORE_WAIT);
+                        }
                     } else {
                         c_spill(cs);
                     }
                 }
+#endif
                 scp_signal(consumed_ctr, wid);
             }
         }
