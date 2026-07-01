@@ -1358,6 +1358,8 @@ struct test_case {
             test_case * tc;
             ggml_backend_t backend1;
             ggml_backend_t backend2;
+            int    total;     // op-node comparisons performed (one per GGML_TEST_REPEAT rep; sentinels excluded)
+            int    passed;    // how many of those were within tolerance
         };
 
         callback_userdata ud {
@@ -1365,6 +1367,8 @@ struct test_case {
             this,
             backend1,
             backend2,
+            0,
+            0,
         };
 
         auto callback = [](int index, ggml_tensor * t1, ggml_tensor * t2, void * user_data) -> bool {
@@ -1382,46 +1386,51 @@ struct test_case {
                 if (memcmp(t1_data.data(), t2_data.data(), ggml_nbytes(t1)) != 0) {
                     printf("sentinel mismatch: %s ", t1->name);
                     ud->ok = false;
-                    return true;
                 }
+                // Sentinels are memory-corruption guards, not the op under test:
+                // never tally them, so GGML_TEST_REPEAT counts only real op runs.
+                return true;
             }
 
             std::vector<float> f1 = tensor_to_float(t1);
             std::vector<float> f2 = tensor_to_float(t2);
 
+            // One op comparison == one GGML_TEST_REPEAT run (for a single-op graph);
+            // `run` is that run's 1-based index, used to label per-run failure lines.
+            const int run = ++ud->total;
+            bool this_ok = true;
             for (size_t i = 0; i < f1.size(); i++) {
                 // check for nans
                 if (std::isnan(f1[i]) || std::isnan(f2[i])) {
-                    printf("[%s] NaN at index %zu (%s=%f %s=%f) ", ggml_op_desc(t1), i, bn1, f1[i], bn2, f2[i]);
-                    ud->ok = false;
-                    return true;
+                    printf("[%s] run %d: NaN at index %zu (%s=%f %s=%f)\n", ggml_op_desc(t1), run, i, bn1, f1[i], bn2, f2[i]);
+                    this_ok = false;
+                    break;
                 }
                 // check for infs: both must be inf of the same sign, or both must be finite
                 if (isinf_or_max(f1[i]) || isinf_or_max(f2[i])) {
                     if (isinf_or_max(f1[i]) && isinf_or_max(f2[i])) {
                         if (std::signbit(f1[i]) != std::signbit(f2[i])) {
-                            printf("[%s] inf sign mismatch: %s=%f %s=%f ", ggml_op_desc(t1), bn1, f1[i], bn2, f2[i]);
-                            ud->ok = false;
-                            return true;
+                            printf("[%s] run %d: inf sign mismatch: %s=%f %s=%f\n", ggml_op_desc(t1), run, bn1, f1[i], bn2, f2[i]);
+                            this_ok = false;
+                            break;
                         }
                     } else {
-                        printf("[%s] inf mismatch: %s=%f %s=%f ", ggml_op_desc(t1), bn1, f1[i], bn2, f2[i]);
-                        ud->ok = false;
-                        return true;
+                        printf("[%s] run %d: inf mismatch: %s=%f %s=%f\n", ggml_op_desc(t1), run, bn1, f1[i], bn2, f2[i]);
+                        this_ok = false;
+                        break;
                     }
                 }
             }
 
-            double err = ud->tc->err(f1.data(), f2.data(), f1.size());
-            if (err > ud->tc->max_err(ud->backend1)) {
-                printf("[%s] ERR = %.9f > %.9f ", ggml_op_desc(t1), err, ud->tc->max_err(ud->backend1));
-                //for (int i = 0; i < (int) f1.size(); i++) {
-                //    printf("%5d %9.6f %9.6f, diff = %9.6f\n", i, f1[i], f2[i], f1[i] - f2[i]);
-                //}
-                //printf("\n");
-                //exit(1);
-                ud->ok = false;
+            if (this_ok) {
+                double err = ud->tc->err(f1.data(), f2.data(), f1.size());
+                if (err > ud->tc->max_err(ud->backend1)) {
+                    printf("[%s] run %d: ERR = %.9f > %.9f\n", ggml_op_desc(t1), run, err, ud->tc->max_err(ud->backend1));
+                    this_ok = false;
+                }
             }
+
+            if (this_ok) { ud->passed++; } else { ud->ok = false; }
             return true;
 
             GGML_UNUSED(index);
@@ -1442,6 +1451,11 @@ struct test_case {
         // Create test result
         bool        test_passed = ud.ok && cmp_ok;
         std::string error_msg   = test_passed ? "" : (!cmp_ok ? "compare failed" : "test failed");
+        // GGML_TEST_REPEAT: report how many device runs matched the single CPU reference.
+        if (ud.total > 1) {
+            printf("  [REPEAT %d/%d passed] %s(%s)\n", ud.passed, ud.total,
+                   current_op_name.c_str(), vars().c_str());
+        }
         test_result result(ggml_backend_name(backend1), current_op_name, vars(), "test", supported, test_passed,
                            error_msg);
 
@@ -7319,6 +7333,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     std::vector<std::unique_ptr<test_case>> test_cases;
     std::default_random_engine rng(0);
 
+    // Q8_0 tensor-engine comprehensive correctness grid (flaky-HW stress):
+    // every K x M combination (uniform and non-uniform) over {1024,2048,4096,8192} x N values.
+    for (int64_t kk : {1024, 2048, 4096, 8192}) {            // K (inner dim)
+        for (int64_t mm : {1024, 2048, 4096, 8192}) {        // M (output features)
+            for (int n : {2000, 1500, 1100, 1024, 2048, 500, 900, 300, 100}) {
+                test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, mm, n, kk, {1, 1}, {1, 1}));
+            }
+        }
+    }
+
     // unary ops
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32}) {
         for (int v : {0, 1}) {
@@ -8857,6 +8881,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_cumsum(GGML_TYPE_F32, { 128, 128, 4, 4 }));
     test_cases.emplace_back(new test_cumsum(GGML_TYPE_F32, { 2048, 16, 5, 4 }));
     test_cases.emplace_back(new test_cumsum(GGML_TYPE_F32, { 20000, 10, 4, 1 }));
+
+    // Q8_0 tensor-engine GEMM sweep: N in {256,512,700,900}, (K,M) in {(2048,2048),(4096,4096)}
+    for (int64_t km : {2048, 4096}) {
+        for (int n : {256, 512, 700, 900}) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, km, n, km, {1, 1}, {1, 1}));
+        }
+    }
 
     for (int bs : {1, 2, 3, 4, 5, 8, 512}) {
         for (ggml_type type_a : all_types) {

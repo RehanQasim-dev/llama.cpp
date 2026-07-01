@@ -2149,6 +2149,16 @@ void ggml_backend_graph_copy_free(struct ggml_backend_graph_copy copy) {
     ggml_free(copy.ctx_unallocated);
 }
 
+// GGML_TEST_REPEAT helper: zero a computed op output before re-running it, so every
+// repeat starts from an identical buffer. Skips sentinels and view ops (which alias
+// their parent's data).
+static void ggml_backend_zero_op_output(struct ggml_tensor * t) {
+    if (t->op == GGML_OP_NONE || ggml_is_view_op(t->op) || t->buffer == NULL) {
+        return;
+    }
+    ggml_backend_tensor_memset(t, 0, 0, ggml_nbytes(t));
+}
+
 bool ggml_backend_compare_graph_backend(ggml_backend_t backend1, ggml_backend_t backend2, struct ggml_cgraph * graph, ggml_backend_eval_callback callback, void * user_data, struct ggml_tensor const * const * test_nodes, size_t num_test_nodes) {
     struct ggml_backend_graph_copy copy = ggml_backend_graph_copy(backend2, graph);
     if (copy.buffer == NULL) {
@@ -2160,42 +2170,74 @@ bool ggml_backend_compare_graph_backend(ggml_backend_t backend1, ggml_backend_t 
 
     assert(g1->n_nodes == g2->n_nodes);
 
+    // GGML_TEST_REPEAT: re-run backend1 (the device under test) this many times while
+    // computing the reference backend2 (CPU) only ONCE — a cheap way to stress flaky
+    // hardware, since the slow CPU reference is not recomputed. Scoped to the ET backend
+    // only; every other backend keeps the original single-run path untouched.
+    int reps = 1;
+    {
+        const char * name = ggml_backend_name(backend1);
+        const char * rs   = getenv("GGML_TEST_REPEAT");
+        if (rs && name && strncmp(name, "ET", 2) == 0) {
+            reps = atoi(rs);
+            if (reps < 1) { reps = 1; }
+        }
+    }
+
     if (num_test_nodes != 0) {
         GGML_ASSERT(test_nodes);
         // Compute the whole graph and only test the output for specific tensors
-        ggml_backend_graph_compute(backend1, g1);
-        ggml_backend_graph_compute(backend2, g2);
-
-        bool verified = false;
-        for (int i = 0; i < g1->n_nodes; i++) {
-            for (size_t j = 0; j < num_test_nodes; ++j) {
-                if (g1->nodes[i] == test_nodes[j]) {
-                    callback(i, g1->nodes[i], g2->nodes[i], user_data);
-                    verified = true;
+        ggml_backend_graph_compute(backend2, g2);   // reference: ONCE
+        for (int rep = 0; rep < reps; rep++) {
+            if (reps > 1) {
+                // Zero every op output so each repeat starts from an identical buffer,
+                // instead of inheriting the previous run's result (see else branch).
+                for (int i = 0; i < g1->n_nodes; i++) {
+                    ggml_backend_zero_op_output(g1->nodes[i]);
                 }
             }
-        }
-        GGML_ASSERT(verified);
-    } else {
-        for (int i = 0; i < g1->n_nodes; i++) {
-            struct ggml_tensor * t1 = g1->nodes[i];
-            struct ggml_tensor * t2 = g2->nodes[i];
-
-            assert(t1->op == t2->op && ggml_are_same_layout(t1, t2));
-
-            struct ggml_cgraph g1v = ggml_graph_view(g1, i, i + 1);
-            struct ggml_cgraph g2v = ggml_graph_view(g2, i, i + 1);
-
-            ggml_backend_graph_compute(backend1, &g1v);
-            ggml_backend_graph_compute(backend2, &g2v);
-
-            if (ggml_is_view_op(t1->op)) {
-                continue;
+            ggml_backend_graph_compute(backend1, g1);   // device under test: each rep
+            bool verified = false;
+            for (int i = 0; i < g1->n_nodes; i++) {
+                for (size_t j = 0; j < num_test_nodes; ++j) {
+                    if (g1->nodes[i] == test_nodes[j]) {
+                        callback(i, g1->nodes[i], g2->nodes[i], user_data);
+                        verified = true;
+                    }
+                }
             }
+            GGML_ASSERT(verified);
+        }
+    } else {
+        // Reference (backend2) computed only on rep 0; backend1 re-run every rep.
+        for (int rep = 0; rep < reps; rep++) {
+            for (int i = 0; i < g1->n_nodes; i++) {
+                struct ggml_tensor * t1 = g1->nodes[i];
+                struct ggml_tensor * t2 = g2->nodes[i];
 
-            // compare results, calculate rms etc
-            if (!callback(i, t1, t2, user_data)) {
-                break;
+                assert(t1->op == t2->op && ggml_are_same_layout(t1, t2));
+
+                struct ggml_cgraph g1v = ggml_graph_view(g1, i, i + 1);
+                // Reset the op output to a known (zeroed) state so every repeat starts
+                // identically — otherwise runs 2..N inherit the previous run's output and
+                // a kernel that only partially writes its result would look correct.
+                if (reps > 1) {
+                    ggml_backend_zero_op_output(t1);
+                }
+                ggml_backend_graph_compute(backend1, &g1v);
+                if (rep == 0) {
+                    struct ggml_cgraph g2v = ggml_graph_view(g2, i, i + 1);
+                    ggml_backend_graph_compute(backend2, &g2v);
+                }
+
+                if (ggml_is_view_op(t1->op)) {
+                    continue;
+                }
+
+                // compare results, calculate rms etc
+                if (!callback(i, t1, t2, user_data)) {
+                    break;
+                }
             }
         }
     }
