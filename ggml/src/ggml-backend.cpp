@@ -2149,14 +2149,32 @@ void ggml_backend_graph_copy_free(struct ggml_backend_graph_copy copy) {
     ggml_free(copy.ctx_unallocated);
 }
 
-// GGML_TEST_REPEAT helper: zero a computed op output before re-running it, so every
-// repeat starts from an identical buffer. Skips sentinels and view ops (which alias
-// their parent's data).
-static void ggml_backend_zero_op_output(struct ggml_tensor * t) {
+// GGML_TEST_REPEAT helper: before re-running an op, fill its output with dirty
+// pseudo-random bytes (varying per rep) instead of leaving it clean. Device memory
+// is NOT zeroed per kernel launch — a freshly allocated / reused output buffer holds
+// arbitrary residue — so this reproduces reality and catches kernels that leave
+// residue or read stale output instead of fully overwriting it. A correct kernel
+// yields the same result regardless of what garbage was there. Skips sentinels and
+// view ops (which alias their parent's data).
+static void ggml_backend_dirty_op_output(struct ggml_tensor * t, int rep) {
     if (t->op == GGML_OP_NONE || ggml_is_view_op(t->op) || t->buffer == NULL) {
         return;
     }
-    ggml_backend_tensor_memset(t, 0, 0, ggml_nbytes(t));
+    const size_t n = ggml_nbytes(t);
+    std::vector<uint8_t> buf(n);
+    // xorshift64, seeded per rep so each repeat starts from different dirty memory.
+    uint64_t s = 0x9E3779B97F4A7C15ULL * (uint64_t)(rep + 1) + 0xD1B54A32D192ED03ULL;
+    uint64_t * w = (uint64_t *) buf.data();
+    const size_t words = n / sizeof(uint64_t);
+    for (size_t i = 0; i < words; i++) {
+        s ^= s << 13; s ^= s >> 7; s ^= s << 17;
+        w[i] = s;
+    }
+    for (size_t i = words * sizeof(uint64_t); i < n; i++) {
+        s ^= s << 13; s ^= s >> 7; s ^= s << 17;
+        buf[i] = (uint8_t) s;
+    }
+    ggml_backend_tensor_set(t, buf.data(), 0, n);
 }
 
 bool ggml_backend_compare_graph_backend(ggml_backend_t backend1, ggml_backend_t backend2, struct ggml_cgraph * graph, ggml_backend_eval_callback callback, void * user_data, struct ggml_tensor const * const * test_nodes, size_t num_test_nodes) {
@@ -2190,10 +2208,10 @@ bool ggml_backend_compare_graph_backend(ggml_backend_t backend1, ggml_backend_t 
         ggml_backend_graph_compute(backend2, g2);   // reference: ONCE
         for (int rep = 0; rep < reps; rep++) {
             if (reps > 1) {
-                // Zero every op output so each repeat starts from an identical buffer,
-                // instead of inheriting the previous run's result (see else branch).
+                // Dirty every op output so each repeat starts from realistic residue
+                // (device memory is not cleared per launch) rather than a clean buffer.
                 for (int i = 0; i < g1->n_nodes; i++) {
-                    ggml_backend_zero_op_output(g1->nodes[i]);
+                    ggml_backend_dirty_op_output(g1->nodes[i], rep);
                 }
             }
             ggml_backend_graph_compute(backend1, g1);   // device under test: each rep
@@ -2218,11 +2236,11 @@ bool ggml_backend_compare_graph_backend(ggml_backend_t backend1, ggml_backend_t 
                 assert(t1->op == t2->op && ggml_are_same_layout(t1, t2));
 
                 struct ggml_cgraph g1v = ggml_graph_view(g1, i, i + 1);
-                // Reset the op output to a known (zeroed) state so every repeat starts
-                // identically — otherwise runs 2..N inherit the previous run's output and
-                // a kernel that only partially writes its result would look correct.
+                // Dirty the op output with realistic residue before each run: device
+                // memory isn't cleared per launch, so a kernel that only partially
+                // writes its result (or reads stale output) must be caught here.
                 if (reps > 1) {
-                    ggml_backend_zero_op_output(t1);
+                    ggml_backend_dirty_op_output(t1, rep);
                 }
                 ggml_backend_graph_compute(backend1, &g1v);
                 if (rep == 0) {
