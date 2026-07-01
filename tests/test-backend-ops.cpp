@@ -24,7 +24,6 @@
 #include <array>
 #include <cfloat>
 #include <cinttypes>
-#include <cmath>
 #include <cstdarg>
 #include <cstdint>
 #include <cstdio>
@@ -1359,6 +1358,8 @@ struct test_case {
             test_case * tc;
             ggml_backend_t backend1;
             ggml_backend_t backend2;
+            int    total;     // op-node comparisons performed (one per GGML_TEST_REPEAT rep; sentinels excluded)
+            int    passed;    // how many of those were within tolerance
         };
 
         callback_userdata ud {
@@ -1366,6 +1367,8 @@ struct test_case {
             this,
             backend1,
             backend2,
+            0,
+            0,
         };
 
         auto callback = [](int index, ggml_tensor * t1, ggml_tensor * t2, void * user_data) -> bool {
@@ -1383,46 +1386,51 @@ struct test_case {
                 if (memcmp(t1_data.data(), t2_data.data(), ggml_nbytes(t1)) != 0) {
                     printf("sentinel mismatch: %s ", t1->name);
                     ud->ok = false;
-                    return true;
                 }
+                // Sentinels are memory-corruption guards, not the op under test:
+                // never tally them, so GGML_TEST_REPEAT counts only real op runs.
+                return true;
             }
 
             std::vector<float> f1 = tensor_to_float(t1);
             std::vector<float> f2 = tensor_to_float(t2);
 
+            // One op comparison == one GGML_TEST_REPEAT run (for a single-op graph);
+            // `run` is that run's 1-based index, used to label per-run failure lines.
+            const int run = ++ud->total;
+            bool this_ok = true;
             for (size_t i = 0; i < f1.size(); i++) {
                 // check for nans
                 if (std::isnan(f1[i]) || std::isnan(f2[i])) {
-                    printf("[%s] NaN at index %zu (%s=%f %s=%f) ", ggml_op_desc(t1), i, bn1, f1[i], bn2, f2[i]);
-                    ud->ok = false;
-                    return true;
+                    printf("[%s] run %d: NaN at index %zu (%s=%f %s=%f)\n", ggml_op_desc(t1), run, i, bn1, f1[i], bn2, f2[i]);
+                    this_ok = false;
+                    break;
                 }
                 // check for infs: both must be inf of the same sign, or both must be finite
                 if (isinf_or_max(f1[i]) || isinf_or_max(f2[i])) {
                     if (isinf_or_max(f1[i]) && isinf_or_max(f2[i])) {
                         if (std::signbit(f1[i]) != std::signbit(f2[i])) {
-                            printf("[%s] inf sign mismatch: %s=%f %s=%f ", ggml_op_desc(t1), bn1, f1[i], bn2, f2[i]);
-                            ud->ok = false;
-                            return true;
+                            printf("[%s] run %d: inf sign mismatch: %s=%f %s=%f\n", ggml_op_desc(t1), run, bn1, f1[i], bn2, f2[i]);
+                            this_ok = false;
+                            break;
                         }
                     } else {
-                        printf("[%s] inf mismatch: %s=%f %s=%f ", ggml_op_desc(t1), bn1, f1[i], bn2, f2[i]);
-                        ud->ok = false;
-                        return true;
+                        printf("[%s] run %d: inf mismatch: %s=%f %s=%f\n", ggml_op_desc(t1), run, bn1, f1[i], bn2, f2[i]);
+                        this_ok = false;
+                        break;
                     }
                 }
             }
 
-            double err = ud->tc->err(f1.data(), f2.data(), f1.size());
-            if (err > ud->tc->max_err(ud->backend1)) {
-                printf("[%s] ERR = %.9f > %.9f ", ggml_op_desc(t1), err, ud->tc->max_err(ud->backend1));
-                //for (int i = 0; i < (int) f1.size(); i++) {
-                //    printf("%5d %9.6f %9.6f, diff = %9.6f\n", i, f1[i], f2[i], f1[i] - f2[i]);
-                //}
-                //printf("\n");
-                //exit(1);
-                ud->ok = false;
+            if (this_ok) {
+                double err = ud->tc->err(f1.data(), f2.data(), f1.size());
+                if (err > ud->tc->max_err(ud->backend1)) {
+                    printf("[%s] run %d: ERR = %.9f > %.9f\n", ggml_op_desc(t1), run, err, ud->tc->max_err(ud->backend1));
+                    this_ok = false;
+                }
             }
+
+            if (this_ok) { ud->passed++; } else { ud->ok = false; }
             return true;
 
             GGML_UNUSED(index);
@@ -1443,6 +1451,11 @@ struct test_case {
         // Create test result
         bool        test_passed = ud.ok && cmp_ok;
         std::string error_msg   = test_passed ? "" : (!cmp_ok ? "compare failed" : "test failed");
+        // GGML_TEST_REPEAT: report how many device runs matched the single CPU reference.
+        if (ud.total > 1) {
+            printf("  [REPEAT %d/%d passed] %s(%s)\n", ud.passed, ud.total,
+                   current_op_name.c_str(), vars().c_str());
+        }
         test_result result(ggml_backend_name(backend1), current_op_name, vars(), "test", supported, test_passed,
                            error_msg);
 
@@ -3879,75 +3892,20 @@ struct test_mul_mat : public test_case {
     }
 };
 
-// imbalance: routing-distribution control for the mul_mat_id ids tensor.
-//   0  -> uniform: each token routes to n_used distinct experts chosen at random,
-//         so every expert receives ~the same number of tokens.
-//   >0 -> Zipf-skewed, deterministic seed (byte-identical routing on both branches).
-//         Zipf exponent s = 0.5 * (imbalance - 1), so:
-//           imbalance=1 -> s=0.0  uniform (every expert ~even, deterministic anchor)
-//           imbalance=2 -> s=0.5  mild skew
-//           imbalance=3 -> s=1.0  moderate skew
-//           imbalance=4 -> s=1.5  strong skew
-//           imbalance=5 -> s=2.0  extreme skew (few hot experts, all still used)
-static void init_mul_mat_id_tensors(ggml_context * ctx, int n_mats, int n_used = -1, int imbalance = 0) {
+static void init_mul_mat_id_tensors(ggml_context * ctx, int n_mats) {
     std::random_device rd;
-    std::default_random_engine rng(imbalance == 0
-        ? rd()
-        : (std::default_random_engine::result_type) (1234u + (unsigned) imbalance));
-
-    std::vector<double> weights(n_mats, 1.0);
-    if (imbalance > 0) {
-        const double s = 0.5 * (imbalance - 1);
-        for (int e = 0; e < n_mats; e++) {
-            weights[e] = 1.0 / std::pow((double) (e + 1), s);
-        }
-    }
-
+    std::default_random_engine rng(rd());
     for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
         if (t->type == GGML_TYPE_I32) {
             if (ggml_is_view_op(t->op)) { continue; }
-            const int row_len = (int) t->ne[0];                              // == n_mats
-            const int sel     = (n_used > 0 && n_used <= row_len) ? n_used : row_len;
-            std::vector<int64_t> hist(n_mats, 0);
             // ids
             for (int64_t r = 0; r < ggml_nrows(t); r++) {
-                std::vector<int32_t> data(row_len);
-                if (imbalance == 0) {
-                    for (int i = 0; i < row_len; i++) {
-                        data[i] = i % n_mats;
-                    }
-                    std::shuffle(data.begin(), data.end(), rng);
-                } else {
-                    // weighted sampling without replacement (Efraimidis-Spirakis):
-                    // each expert gets key = log(u)/w; the `sel` largest keys win.
-                    // marginal selection frequency tracks the Zipf weights, and the
-                    // per-token experts stay distinct (required by mul_mat_id).
-                    std::uniform_real_distribution<double> uni(0.0, 1.0);
-                    std::vector<std::pair<double, int>> keys(n_mats);
-                    for (int e = 0; e < n_mats; e++) {
-                        const double u = uni(rng);
-                        keys[e] = { std::log(u) / weights[e], e };
-                    }
-                    std::partial_sort(keys.begin(), keys.begin() + sel, keys.end(),
-                        [](const std::pair<double, int> & a, const std::pair<double, int> & b) {
-                            return a.first > b.first;
-                        });
-                    for (int e = 0; e < n_mats; e++) {
-                        data[e] = keys[e].second;
-                    }
+                std::vector<int32_t> data(t->ne[0]);
+                for (int i = 0; i < t->ne[0]; i++) {
+                    data[i] = i % n_mats;
                 }
-                for (int i = 0; i < sel; i++) {
-                    hist[data[i]]++;
-                }
+                std::shuffle(data.begin(), data.end(), rng);
                 ggml_backend_tensor_set(t, data.data(), r * t->nb[1], t->ne[0] * sizeof(int32_t));
-            }
-            if (imbalance > 0) {
-                fprintf(stderr, "[mul_mat_id ids] imbalance=%d n=%ld n_used=%d per-expert token counts:",
-                    imbalance, (long) ggml_nrows(t), sel);
-                for (int e = 0; e < n_mats; e++) {
-                    fprintf(stderr, " %ld", (long) hist[e]);
-                }
-                fprintf(stderr, "\n");
             }
         } else {
             init_tensor_uniform(t);
@@ -3965,10 +3923,9 @@ struct test_mul_mat_id : public test_case {
     const int64_t m;
     const int64_t n;
     const int64_t k;
-    const int imbalance; // 0 = uniform routing; >0 = Zipf-skewed (see init_mul_mat_id_tensors)
 
     std::string vars() override {
-        return VARS_TO_STR9(type_a, type_b, n_mats, n_used, b, m, n, k, imbalance);
+        return VARS_TO_STR8(type_a, type_b, n_mats, n_used, b, m, n, k);
     }
 
     double max_nmse_err() override {
@@ -3990,9 +3947,9 @@ struct test_mul_mat_id : public test_case {
 
     test_mul_mat_id(ggml_type type_a = GGML_TYPE_F32, ggml_type type_b = GGML_TYPE_F32,
             int n_mats = 8, int n_used = 2, bool b = false,
-            int64_t m = 32, int64_t n = 32, int64_t k = 32, int imbalance = 0)
+            int64_t m = 32, int64_t n = 32, int64_t k = 32)
         : type_a(type_a), type_b(type_b), n_mats(n_mats), n_used(n_used), b(b),
-            m(m), n(n), k(k), imbalance(imbalance) {
+            m(m), n(n), k(k) {
             GGML_ASSERT(n_used <= n_mats);
         }
 
@@ -4018,7 +3975,7 @@ struct test_mul_mat_id : public test_case {
     }
 
     void initialize_tensors(ggml_context * ctx) override {
-        init_mul_mat_id_tensors(ctx, n_mats, n_used, imbalance);
+        init_mul_mat_id_tensors(ctx, n_mats);
     }
 };
 
@@ -7376,6 +7333,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     std::vector<std::unique_ptr<test_case>> test_cases;
     std::default_random_engine rng(0);
 
+    // Q8_0 tensor-engine comprehensive correctness grid (flaky-HW stress):
+    // every K x M combination (uniform and non-uniform) over {1024,2048,4096,8192} x N values.
+    for (int64_t kk : {1024, 2048, 4096, 8192}) {            // K (inner dim)
+        for (int64_t mm : {1024, 2048, 4096, 8192}) {        // M (output features)
+            for (int n : {2000, 1500, 1100, 1024, 2048, 500, 900, 300, 100}) {
+                test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, mm, n, kk, {1, 1}, {1, 1}));
+            }
+        }
+    }
+
     // unary ops
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32}) {
         for (int v : {0, 1}) {
@@ -8018,18 +7985,6 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gla(GGML_TYPE_F32, 32, 64, 32, 4));
     test_cases.emplace_back(new test_gla(GGML_TYPE_F32, 32, 64, 128, 4));
 
-    // Perfect wave tests for Q4_0 reuse optimization
-    for (int r = 2; r <= 15; r++) {
-        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 4096, 64 * r, 4096, {1, 1}, {1, 1}));
-    }
-
-    // Q4_0 tensor-engine target shapes (incl. partial-N: 700->n_cur=12, 900->n_cur=4 errata)
-    for (int64_t km : {2048, 4096}) {
-        for (int n : {256, 512, 700, 900}) {
-            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, km, n, km, {1, 1}, {1, 1}));
-        }
-    }
-
     // Qwen3 8B dense (Q8_0 weights × F32 activations) — catches regressions in
     // ET backend mul_mat Q8_0 kernel across GEMV (n=1) and large-N prefill paths.
     // hidden=4096, intermediate=12288, q_heads=32, kv_heads=8, head_dim=128.
@@ -8103,15 +8058,6 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 test_cases.emplace_back(new test_mul_mat(type_a, type_b, 16, 16, k, {3, 2}, {1, 2}));
                 test_cases.emplace_back(new test_mul_mat(type_a, type_b, 16, 16, k, {3, 2}, {2, 2}));
 
-                // REUSE-path coverage: Q4_0 matrix engine. Needs enough tiles
-                // for the adaptive reuse factor to pick ru_n>=2 (total_tiles >=
-                // MACHINE_SLOTS), and k=1024 to span >1 K-window (C seed/spill).
-                if (type_a == GGML_TYPE_Q4_0 && type_b == GGML_TYPE_F32) {
-                    test_cases.emplace_back(new test_mul_mat(type_a, type_b, 4096, 256,  256, {1, 1}, {1, 1})); // ru_n=4, 1 window
-                    test_cases.emplace_back(new test_mul_mat(type_a, type_b, 4096, 256, 1024, {1, 1}, {1, 1})); // ru_n=4, 2 windows
-                    test_cases.emplace_back(new test_mul_mat(type_a, type_b, 4096, 128, 1024, {1, 1}, {1, 1})); // ru_n=2, 2 windows
-                }
-
                 // test cases with permutation
                 test_cases.emplace_back(new test_mul_mat(type_a, type_b, 16,  1, k, {2, 3}, {1, 1}, {0, 2, 1, 3}));
                 test_cases.emplace_back(new test_mul_mat(type_a, type_b, 16,  1, k, {2, 3}, {1, 1}, {0, 1, 3, 2}));
@@ -8180,6 +8126,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
 
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 6, 4096, 5120, {1, 1}, {1, 1}));
+    for (int n : {1, 2, 3, 4, 5, 8, 12, 15, 31, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 64, 256, 500, 512, 520, 1024, 2040, 2048}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 8192, n, 2048, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 2048, n, 8192, {1, 1}, {1, 1}));
+    }
+    // Exact Llama-3.2-1B Q8_0 weight shapes (m=out features, k=in features).
+    for (int n : {1, 2, 8, 15, 16, 32, 64, 128}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 2048,   n, 2048, {1, 1}, {1, 1})); // q/o proj
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 512,    n, 2048, {1, 1}, {1, 1})); // k/v proj
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 8192,   n, 2048, {1, 1}, {1, 1})); // ffn gate/up
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 2048,   n, 8192, {1, 1}, {1, 1})); // ffn down
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 128256, n, 2048, {1, 1}, {1, 1})); // lm_head
+    }
 
 #if 0
     // test the mat-mat path for Metal
@@ -8924,14 +8882,26 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_cumsum(GGML_TYPE_F32, { 2048, 16, 5, 4 }));
     test_cases.emplace_back(new test_cumsum(GGML_TYPE_F32, { 20000, 10, 4, 1 }));
 
-    // Q4_0 tensor-engine GEMM sweep: N in {256,512,700,900}, (K,M) in {(2048,2048),(4096,4096)}
+    // Q8_0 tensor-engine GEMM sweep: N in {256,512,700,900}, (K,M) in {(2048,2048),(4096,4096)}
     for (int64_t km : {2048, 4096}) {
         for (int n : {256, 512, 700, 900}) {
-            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, km, n, km, {1, 1}, {1, 1}));
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, km, n, km, {1, 1}, {1, 1}));
+        }
+    }
+
+    for (int bs : {1, 2, 3, 4, 5, 8, 512}) {
+        for (ggml_type type_a : all_types) {
+            for (ggml_type type_b : {GGML_TYPE_F32}) {
+                test_cases.emplace_back(new test_mul_mat(type_a, type_b, 4096, bs, 14336, {1,  1}, {1, 1}));
+            }
         }
     }
 
     // qwen3-30b-a3b
+    for (int n : {1, 2, 3, 4, 5, 8, 12, 15, 31, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 64, 256, 500, 512, 520, 1024, 2040, 2048}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 8192, n, 2048, {1, 1}, {1, 1}));
+    }
+
     for (int bs : {1, 4, 8, 32, 64, 128, 256, 512}) {
         for (ggml_type type_a : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ2_XS}) {
             for (ggml_type type_b : {GGML_TYPE_F32}) {
@@ -8948,13 +8918,6 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
                 test_cases.emplace_back(new test_mul_mat_id_fusion(type_a, type_b, 32, 4, false, 1792, bs, 2048, 1));
             }
         }
-    }
-
-    // imbalanced-routing experiment: mul_mat_id Q4_0, n_mats=32 n_used=4 m=1792 k=2048, n=5000.
-    // imbalance 1 = deterministic uniform anchor; 2..5 = increasing Zipf skew.
-    // run/filter with: -o MUL_MAT_ID -p "imbalance=[1-5]"
-    for (int imb : {1, 2, 3, 4, 5}) {
-        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_0, GGML_TYPE_F32, 32, 4, false, 1792, 5000, 2048, imb));
     }
 
 

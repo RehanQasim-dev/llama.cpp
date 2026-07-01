@@ -318,6 +318,24 @@ static void ggml_backend_et_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml
     runtime->waitForEvent(event);
 }
 
+static void ggml_backend_et_buffer_memset_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, uint8_t value, size_t offset, size_t size) {
+    if (size == 0) {
+        return;
+    }
+
+    ggml_backend_et_device_context * dev_ctx = (ggml_backend_et_device_context *)buffer->buft->device->context;
+    if (!dev_ctx) {
+        GGML_LOG_ERROR("ET: Failed to get device context for memset_tensor");
+        return;
+    }
+
+    // Fill the tensor's device memory using the same device-side memset kernel as buffer_clear.
+    std::byte * dst_ptr = static_cast<std::byte*>(tensor->data) + offset;
+    if (!ggml_et_memset(dev_ctx, dst_ptr, value, size)) {
+        GGML_LOG_ERROR("ET: memset_tensor failed using memset kernel for tensor %s", tensor->name);
+    }
+}
+
 static void ggml_backend_et_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
     std::shared_ptr<rt::IRuntime> runtime = ggml_et_runtime();
     if (!runtime) {
@@ -369,7 +387,7 @@ static const struct ggml_backend_buffer_i ggml_backend_et_buffer_i = {
     /* .free_buffer     = */ ggml_backend_et_buffer_free_buffer,
     /* .get_base        = */ ggml_backend_et_buffer_get_base,
     /* .init_tensor     = */ ggml_backend_et_buffer_init_tensor,
-    /* .memset_tensor   = */ NULL,
+    /* .memset_tensor   = */ ggml_backend_et_buffer_memset_tensor,
     /* .set_tensor      = */ ggml_backend_et_buffer_set_tensor,
     /* .get_tensor      = */ ggml_backend_et_buffer_get_tensor,
     /* .set_tensor_2d   = */ NULL,
