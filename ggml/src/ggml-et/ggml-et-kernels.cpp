@@ -2,6 +2,7 @@
 #include "ggml-impl.h"
 #include "ggml-et-kernels-embed.hpp"
 #include "ggml-et-uberkernel-kernel-map.h"
+#include "ggml-et-profile.h"
 #include <fstream>
 #include <cstdlib>
 #include <cstring>
@@ -190,11 +191,17 @@ static bool ggml_et_launch_kernel_internal(ggml_backend_et_device_context* dev_c
 
     try {
         // Setup kernel launch options
+        // Perf-counter profiling (test-backend-ops perf --et-perf-counters) needs
+        // user tracing enabled so the device-side profile.c wrapper can emit PMC
+        // snapshots. Fold it into the same trace-buffer path as enable_print.
+        const bool profiling  = ggml_et_profile_active();
+        const bool want_trace = enable_print || profiling;
+
         rt::KernelLaunchOptions k_opts;
         k_opts.setShireMask(shire_mask);  // Default: all shires (0xFFFFFFFF)
         k_opts.setBarrier(true);          // Wait for completion
         k_opts.setFlushL3(false);         // No L3 flush needed
-        if(enable_print) {
+        if(want_trace) {
             k_opts.setUserTracing(
                 reinterpret_cast<uint64_t>(dev_ctx->trace_buffer),
                 static_cast<uint32_t>(ET_TRACE_BUFFER_SIZE),
@@ -221,19 +228,24 @@ static bool ggml_et_launch_kernel_internal(ggml_backend_et_device_context* dev_c
         runtime->kernelLaunch(dev_ctx->default_stream, kernel_id,
                              reinterpret_cast<std::byte*>(params), params_size, k_opts);
 
-        if(enable_print) {
+        if(want_trace) {
             std::vector<std::byte> hostTraceBuf(ET_TRACE_BUFFER_SIZE);
             runtime->memcpyDeviceToHost(
                 dev_ctx->default_stream, dev_ctx->trace_buffer, hostTraceBuf.data(), ET_TRACE_BUFFER_SIZE);
             runtime->waitForStream(dev_ctx->default_stream);
-            const auto* traceHeader = reinterpret_cast<const trace_buffer_std_header_t*>(hostTraceBuf.data());
-            const trace_entry_header_t* entry = nullptr;
-            while ((entry = Trace_Decode(traceHeader, entry))) {
-                if (entry->type != TRACE_TYPE_STRING) {
-                    continue;
+            if(enable_print) {
+                const auto* traceHeader = reinterpret_cast<const trace_buffer_std_header_t*>(hostTraceBuf.data());
+                const trace_entry_header_t* entry = nullptr;
+                while ((entry = Trace_Decode(traceHeader, entry))) {
+                    if (entry->type != TRACE_TYPE_STRING) {
+                        continue;
+                    }
+                    const auto* strEntry = reinterpret_cast<const trace_string_t*>(entry);
+                    printf("[hart %d] %s", entry->hart_id, strEntry->string);
                 }
-                const auto* strEntry = reinterpret_cast<const trace_string_t*>(entry);
-                printf("[hart %d] %s", entry->hart_id, strEntry->string);
+            }
+            if(profiling) {
+                ggml_et_profile_accumulate(kernel_name, hostTraceBuf.data(), ET_TRACE_BUFFER_SIZE);
             }
         }
 

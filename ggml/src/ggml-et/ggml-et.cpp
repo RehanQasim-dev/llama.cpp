@@ -3,6 +3,7 @@
 #include "ggml-et-kernels.h"
 #include "ggml-et-memops.h"
 #include "ggml-et-ops.h"
+#include "ggml-et-profile.h"
 
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
@@ -1872,7 +1873,13 @@ static ggml_backend_dev_t ggml_backend_et_reg_get_device(ggml_backend_reg_t reg,
 
 static void * ggml_backend_et_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
-    GGML_UNUSED(name);
+    // Optional ET perf-counter hooks used by test-backend-ops perf mode.
+    if (strcmp(name, "ggml_backend_et_perf_counters_begin") == 0) {
+        return (void *) ggml_et_profile_begin;
+    }
+    if (strcmp(name, "ggml_backend_et_perf_counters_end") == 0) {
+        return (void *) ggml_et_profile_end;
+    }
     return nullptr;
 }
 

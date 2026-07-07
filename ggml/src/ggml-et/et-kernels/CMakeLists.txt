@@ -42,7 +42,16 @@ foreach(KERNEL ${KERNELS})
     target_sources(${KERNEL}.elf PRIVATE
         src/${KERNEL}.c
         src/crt.S
+        src/profile.c
     )
+    # crt.S calls et_kernel_entry (profile.c), which snapshots PMCs and then
+    # calls the kernel body. Rename the kernel's entry_point to user_kernel so
+    # the wrapper can reach it. Scope the rename to this .elf target (not the
+    # shared source file) so it does not leak into the uber_* object libraries,
+    # which rename entry_point to <kernel>_entry instead. profile.c/crt.S do not
+    # use the entry_point token, so the define is a harmless no-op for them.
+    target_compile_definitions(${KERNEL}.elf PRIVATE
+        $<$<COMPILE_LANGUAGE:C>:entry_point=user_kernel>)
     target_include_directories(${KERNEL}.elf PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src
         ${CMAKE_CURRENT_SOURCE_DIR}/..

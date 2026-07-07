@@ -156,6 +156,7 @@ ggml_add_backend_library(ggml-et
                          ggml-et-memops.cpp
                          ggml-et-ops.cpp
                          ggml-et-cpu-compare.cpp
+                         ggml-et-profile.cpp
                         )
 
 # Mark generated files as such
