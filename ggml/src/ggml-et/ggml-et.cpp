@@ -1572,8 +1572,12 @@ static bool ggml_backend_et_device_supports_op(ggml_backend_dev_t dev, const ggm
 }
 
 static bool ggml_backend_et_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
-    GGML_UNUSED(dev);
-    return buft->iface.get_name == ggml_backend_et_buffer_type_get_name;
+    if (buft->iface.get_name != ggml_backend_et_buffer_type_get_name) {
+        return false;
+    }
+    ggml_backend_et_device_context * dev_ctx = (ggml_backend_et_device_context *)dev->context;
+    ggml_backend_et_buffer_type_context * buft_ctx = (ggml_backend_et_buffer_type_context *)buft->context;
+    return dev_ctx->devidx == buft_ctx->devidx;
 }
 
 static bool ggml_backend_et_device_offload_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
