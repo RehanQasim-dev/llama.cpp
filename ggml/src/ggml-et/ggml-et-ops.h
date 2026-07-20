@@ -40,6 +40,16 @@ struct ggml_et_binary_params {
     ggml_tensor dst;
 };
 
+// Q8_0 mul_mat with optional residual bias.
+// bias.data == NULL means "no bias" - kernel skips the add.
+// When non-NULL, bias must have the same shape and strides as dst.
+struct ggml_et_mm_q8_params {
+    ggml_tensor src0;
+    ggml_tensor src1;
+    ggml_tensor dst;
+    ggml_tensor bias;
+};
+
 // Element map parameters for embarrassingly parallel binary operations (MUL, ADD, etc.)
 // Operation type is determined by dst->op (GGML_OP_MUL, GGML_OP_ADD, etc.)
 struct ggml_et_elmap_params {

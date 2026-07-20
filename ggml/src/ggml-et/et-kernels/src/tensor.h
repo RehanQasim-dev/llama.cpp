@@ -144,6 +144,9 @@ ger values in the vector register file.
 */
 #define TENSOR_LOAD_WAIT_0 0
 
+#define TENSOR_FMA_OP_FP32 0  // TensorFMA32: FP32 x FP32 -> FP32
+#define TENSOR_LOAD_PLAIN  0  // TensorLoad: 64B rows
+
 /*! \def TENSOR_LOAD_WAIT_1
     \brief Tensor load to L1 Scratchpad with ID = 1 is complete.
 */

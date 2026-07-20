@@ -315,11 +315,20 @@ bool ggml_et_op_mul_mat(ggml_backend_et_device_context* dev_ctx, const ggml_tens
     const char* kernel_name;
     const char* src0_type_name;
 
-    if (node->type == GGML_TYPE_F32 &&
-        node->src[0]->type == GGML_TYPE_Q8_0 &&
-        node->src[1]->type == GGML_TYPE_F32) {
+    if (node->type == GGML_TYPE_F32 && node->src[0]->type == GGML_TYPE_Q8_0 &&
+        node->src[1]->type == GGML_TYPE_F32 &&
+        node->src[1]->ne[1] >= 47 &&      // N >= 47
+        node->src[0]->ne[1] % 16 == 0 &&  // M % TILE_M
+        node->src[0]->ne[0] % 32 == 0) {  // K % BLOCK_K (Q8_0 block)
 
-        kernel_name = "mul_mat_Q8_0";
+        kernel_name    = "mul_mat_Q8_0_matrix_engine";
+        src0_type_name = "Q8_0";
+
+    } else if (node->type == GGML_TYPE_F32 &&
+               node->src[0]->type == GGML_TYPE_Q8_0 &&
+               node->src[1]->type == GGML_TYPE_F32) {
+
+        kernel_name    = "mul_mat_Q8_0";  // N < 47, or M % 16 != 0 or K % 32 != 0
         src0_type_name = "Q8_0";
 
     } else if (node->type == GGML_TYPE_F32 &&
@@ -369,7 +378,19 @@ bool ggml_et_op_mul_mat(ggml_backend_et_device_context* dev_ctx, const ggml_tens
         }
     }
 
-    bool kernel_result = ggml_et_launch_kernel(dev_ctx, kernel_name, &params, sizeof(params), 0xFFFFFFFF);
+    bool kernel_result;
+    if (node->src[0]->type == GGML_TYPE_Q8_0) {
+        // Both Q8_0 kernels (plain and matrix-engine) take the extended
+        // struct. No fused-add support here (out of scope for this port) -
+        // bias.data stays NULL, so both kernels just skip the add entirely.
+        ggml_et_mm_q8_params q8_params = {};
+        q8_params.src0                 = params.src0;
+        q8_params.src1                 = params.src1;
+        q8_params.dst                  = params.dst;
+        kernel_result = ggml_et_launch_kernel(dev_ctx, kernel_name, &q8_params, sizeof(q8_params), 0xFFFFFFFF);
+    } else {
+        kernel_result = ggml_et_launch_kernel(dev_ctx, kernel_name, &params, sizeof(params), 0xFFFFFFFF);
+    }
 
         // printf("Tensor error:");
     // if (params.src0.data != NULL)
